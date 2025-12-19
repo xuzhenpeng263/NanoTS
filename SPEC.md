@@ -88,24 +88,29 @@ Payload:
 Header:
 
 - `magic`: 4 bytes = `NTSC`
-- `version`: u8 = `1`
-- `ncols`: u16
+  - `version`: u8 = `2`
+  - `ncols`: u16
 
 Then repeated `ncols` times:
 
 - `name_len`: u16
 - `name_bytes`: `name_len` bytes (UTF-8)
+- `col_type`: u8
+  - `1` = Float64
+  - `2` = Int64
+  - `3` = Bool
+  - `4` = Utf8
 
 Notes:
 
-- v0 schemas are **Float64-only** value columns; `ts_ms` is implicit.
+- v1 schemas (version=1) are **Float64-only** value columns; `ts_ms` is implicit.
 
 ## Table segment payload (multi-column)
 
 Segment header:
 
 - `magic`: 4 bytes = `NTTB`
-- `version`: u8 = `1`
+- `version`: u8 = `2`
 - `min_seq`: u64
 - `max_seq`: u64
 - `count`: u32 (rows in this segment)
@@ -130,11 +135,19 @@ Column blocks:
 
 Then repeated `ncols` times:
 
+- `null_len`: u32 (bytes, `0` when no nulls)
+- `null_bytes`: `null_len` bytes (validity bitmap, LSB-first)
 - `col_codec`: u8
   - `2` = `TABLE_COL_F64_XOR` (Gorilla XOR-style)
-  - `3` = `TABLE_COL_I64_D2` (auto fallback when Float64 values are exact integers; stored as compressed `i64`)
+  - `3` = `TABLE_COL_I64_D2` (compressed `i64`)
+  - `4` = `TABLE_COL_BOOL` (bit-packed bools)
+  - `5` = `TABLE_COL_UTF8` (offsets + data)
 - `col_len`: u32 (bytes)
 - `col_bytes`: `col_len` bytes (per codec)
+
+Notes:
+
+- v1 table segments (version=1) have no null bitmap field and only support Float64 columns.
 
 ## Series segment payload (legacy single-column)
 

@@ -258,8 +258,8 @@ pub extern "C" fn nanots_query_table_range_arrow(
     }
 
     let mut columns: Vec<(&str, Vec<f64>)> = Vec::with_capacity(schema.columns.len());
-    for (name, col) in schema.columns.iter().zip(cols) {
-        columns.push((name.as_str(), col));
+    for (col_schema, col) in schema.columns.iter().zip(cols) {
+        columns.push((col_schema.name.as_str(), col));
     }
 
     match crate::arrow::export_ts_f64_table_to_c(&table, ts, columns, unsafe { &mut *out_array }, unsafe { &mut *out_schema }) {

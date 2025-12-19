@@ -9,7 +9,7 @@
 数据库为单文件（通常为 `*.ntt`），文件头为：
 
 - `magic`：4 bytes = `NTSF`
-- `version`：u8 = `1`
+- `version`：u8 = `2`
 
 文件头之后是连续的**记录（record）**：
 
@@ -95,17 +95,22 @@ Header：
 
 - `name_len`：u16
 - `name_bytes`：`name_len` bytes（UTF-8）
+- `col_type`：u8
+  - `1` = Float64
+  - `2` = Int64
+  - `3` = Bool
+  - `4` = Utf8
 
 说明：
 
-- v0 schema 仅支持 **Float64** 取值列；`ts_ms` 为隐含列。
+- v1 schema（version=1）仅支持 **Float64** 取值列；`ts_ms` 为隐含列。
 
 ## Table Segment Payload（多列）
 
 Segment header：
 
 - `magic`：4 bytes = `NTTB`
-- `version`：u8 = `1`
+- `version`：u8 = `2`
 - `min_seq`：u64
 - `max_seq`：u64
 - `count`：u32（该段行数）
@@ -130,11 +135,19 @@ Extension header（v1+）：
 
 接着重复 `ncols` 次：
 
+- `null_len`：u32（bytes，`0` 表示无 NULL）
+- `null_bytes`：`null_len` bytes（有效位图，LSB-first）
 - `col_codec`：u8
   - `2` = `TABLE_COL_F64_XOR`（Gorilla XOR 风格）
-  - `3` = `TABLE_COL_I64_D2`（当 Float64 实际为整数时自动回退，按 `i64` 压缩存储）
+  - `3` = `TABLE_COL_I64_D2`（`i64` 压缩存储）
+  - `4` = `TABLE_COL_BOOL`（bool 位图）
+  - `5` = `TABLE_COL_UTF8`（offsets + data）
 - `col_len`：u32（bytes）
 - `col_bytes`：`col_len` bytes（按 codec 编码）
+
+说明：
+
+- v1 table segment（version=1）没有 null bitmap 字段，仅支持 Float64 列。
 
 ## Series Segment Payload（历史单列）
 

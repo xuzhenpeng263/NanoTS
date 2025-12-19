@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use nanots_core::arrow::{ArrowArray, ArrowSchema};
+use nanots_core::db::{ColumnData, ColumnType, Value};
 use nanots_core::{NanoTsDb, NanoTsOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyString};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -37,6 +38,17 @@ impl Db {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    fn create_table_typed(&self, table: &str, columns: Vec<(String, String)>) -> PyResult<()> {
+        let mut cols: Vec<(&str, ColumnType)> = Vec::with_capacity(columns.len());
+        for (name, ty) in &columns {
+            let col_type = parse_column_type(ty)?;
+            cols.push((name.as_str(), col_type));
+        }
+        let mut db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+        db.create_table_typed(table, &cols)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     fn append(&self, series: &str, ts_ms: i64, value: f64) -> PyResult<u64> {
         let mut db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
         db.append(series, ts_ms, value)
@@ -46,6 +58,17 @@ impl Db {
     fn append_row(&self, table: &str, ts_ms: i64, values: Vec<f64>) -> PyResult<u64> {
         let mut db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
         db.append_row(table, ts_ms, &values)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn append_row_typed(&self, py: Python<'_>, table: &str, ts_ms: i64, values: Vec<PyObject>) -> PyResult<u64> {
+        let mut out: Vec<Value> = Vec::with_capacity(values.len());
+        for v in values {
+            let value = py_to_value(v.as_ref(py))?;
+            out.push(value);
+        }
+        let mut db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+        db.append_row_typed(table, ts_ms, &out)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -79,6 +102,49 @@ impl Db {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    fn query_table_range_typed(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> PyResult<(Vec<i64>, Vec<Vec<PyObject>>)> {
+        let db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+        let (ts, cols) = db
+            .query_table_range_typed(table, start_ms, end_ms)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut out_cols: Vec<Vec<PyObject>> = Vec::with_capacity(cols.len());
+        for col in cols {
+            match col {
+                ColumnData::F64(values) => out_cols.push(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
+                        .collect(),
+                ),
+                ColumnData::I64(values) => out_cols.push(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
+                        .collect(),
+                ),
+                ColumnData::Bool(values) => out_cols.push(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
+                        .collect(),
+                ),
+                ColumnData::Utf8(values) => out_cols.push(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
+                        .collect(),
+                ),
+            }
+        }
+        Ok((ts, out_cols))
+    }
+
     /// Returns two PyCapsules: (arrow_array_capsule, arrow_schema_capsule).
     /// Import in Python with `pyarrow.Array._import_from_c(...)`.
     fn query_table_range_arrow_capsules(
@@ -93,17 +159,17 @@ impl Db {
             .table_schema(table)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let (ts, cols) = db
-            .query_table_range_columns(table, start_ms, end_ms)
+            .query_table_range_typed(table, start_ms, end_ms)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let mut columns: Vec<(&str, Vec<f64>)> = Vec::with_capacity(schema.columns.len());
-        for (name, col) in schema.columns.iter().zip(cols) {
-            columns.push((name.as_str(), col));
+        let mut columns: Vec<(&str, ColumnData)> = Vec::with_capacity(schema.columns.len());
+        for (col_schema, col) in schema.columns.iter().zip(cols) {
+            columns.push((col_schema.name.as_str(), col));
         }
 
         let mut array = Box::new(unsafe { std::mem::zeroed::<ArrowArray>() });
         let mut schema_out = Box::new(unsafe { std::mem::zeroed::<ArrowSchema>() });
-        nanots_core::arrow::export_ts_f64_table_to_c(
+        nanots_core::arrow::export_ts_table_to_c(
             table,
             ts,
             columns,
@@ -207,7 +273,7 @@ impl Db {
         Ok(stream_capsule)
     }
 
-    fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
+fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
         let db = self
             .inner
             .lock()
@@ -280,6 +346,39 @@ impl Db {
             None => Ok(py.None()),
         }
     }
+}
+
+fn parse_column_type(ty: &str) -> PyResult<ColumnType> {
+    let norm = ty.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "f64" | "float" | "double" => Ok(ColumnType::F64),
+        "i64" | "int" | "integer" => Ok(ColumnType::I64),
+        "bool" | "boolean" => Ok(ColumnType::Bool),
+        "str" | "string" | "utf8" => Ok(ColumnType::Utf8),
+        _ => Err(PyRuntimeError::new_err("unsupported column type")),
+    }
+}
+
+fn py_to_value(obj: &PyAny) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if obj.is_instance_of::<PyBool>()? {
+        return Ok(Value::Bool(obj.extract::<bool>()?));
+    }
+    if obj.is_instance_of::<PyInt>()? {
+        return Ok(Value::I64(obj.extract::<i64>()?));
+    }
+    if obj.is_instance_of::<PyFloat>()? {
+        return Ok(Value::F64(obj.extract::<f64>()?));
+    }
+    if obj.is_instance_of::<PyString>()? {
+        return Ok(Value::Utf8(obj.extract::<String>()?));
+    }
+    Err(PyRuntimeError::new_err(format!(
+        "unsupported value type: {}",
+        obj.get_type().name()?
+    )))
 }
 
 #[pymodule]

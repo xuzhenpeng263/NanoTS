@@ -2,7 +2,7 @@
 
 use crate::compressor::TimeSeriesCompressor;
 use crate::compressor::{compress_f64_xor, decompress_f64_xor};
-use crate::db::{Point, TableSchema};
+use crate::db::{ColumnData, ColumnSchema, ColumnType, Point, TableSchema};
 use crate::dbfile;
 use memmap2::MmapOptions;
 use std::collections::HashMap;
@@ -16,12 +16,14 @@ const SEG_VERSION: u8 = 1;
 const TS_CODEC_TS64: u8 = 1;
 
 const TABLE_MAGIC: &[u8; 4] = b"NTTB";
-const TABLE_VERSION: u8 = 1;
+const TABLE_VERSION: u8 = 2;
 const TABLE_COL_F64_XOR: u8 = 2;
 const TABLE_COL_I64_D2: u8 = 3;
+const TABLE_COL_BOOL: u8 = 4;
+const TABLE_COL_UTF8: u8 = 5;
 
 const SCHEMA_MAGIC: &[u8; 4] = b"NTSC";
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
 
 const META_MAGIC: &[u8; 4] = b"NTSM";
 const META_VERSION: u8 = 1;
@@ -169,7 +171,7 @@ impl Storage {
         table: &str,
         schema: &TableSchema,
         ts_ms: &[i64],
-        cols: &[Vec<f64>],
+        cols: &[ColumnData],
         min_seq: u64,
         max_seq: u64,
     ) -> io::Result<()> {
@@ -179,9 +181,27 @@ impl Storage {
         if cols.len() != schema.columns.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "schema mismatch"));
         }
-        for c in cols {
-            if c.len() != ts_ms.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "column length mismatch"));
+        for (c, col) in cols.iter().zip(schema.columns.iter()) {
+            let len = match c {
+                ColumnData::F64(v) => v.len(),
+                ColumnData::I64(v) => v.len(),
+                ColumnData::Bool(v) => v.len(),
+                ColumnData::Utf8(v) => v.len(),
+            };
+            if len != ts_ms.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "column length mismatch",
+                ));
+            }
+            match (c, col.col_type) {
+                (ColumnData::F64(_), ColumnType::F64)
+                | (ColumnData::I64(_), ColumnType::I64)
+                | (ColumnData::Bool(_), ColumnType::Bool)
+                | (ColumnData::Utf8(_), ColumnType::Utf8) => {}
+                _ => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "schema mismatch"));
+                }
             }
         }
 
@@ -315,16 +335,35 @@ impl Storage {
         schema: &TableSchema,
         start_ms: i64,
         end_ms: i64,
-    ) -> io::Result<(Vec<i64>, Vec<Vec<f64>>)> {
+    ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
         let index = self.load_or_rebuild_table_index(table)?;
         if index.is_empty() {
-            return Ok((Vec::new(), schema.columns.iter().map(|_| Vec::new()).collect()));
+            let cols = schema
+                .columns
+                .iter()
+                .map(|col| match col.col_type {
+                    ColumnType::F64 => ColumnData::F64(Vec::new()),
+                    ColumnType::I64 => ColumnData::I64(Vec::new()),
+                    ColumnType::Bool => ColumnData::Bool(Vec::new()),
+                    ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+                })
+                .collect();
+            return Ok((Vec::new(), cols));
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         let mut out_ts: Vec<i64> = Vec::new();
-        let mut out_cols: Vec<Vec<f64>> = schema.columns.iter().map(|_| Vec::new()).collect();
+        let mut out_cols: Vec<ColumnData> = schema
+            .columns
+            .iter()
+            .map(|col| match col.col_type {
+                ColumnType::F64 => ColumnData::F64(Vec::new()),
+                ColumnType::I64 => ColumnData::I64(Vec::new()),
+                ColumnType::Bool => ColumnData::Bool(Vec::new()),
+                ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+            })
+            .collect();
 
         for e in index {
             if e.max_ts < start_ms || e.min_ts > end_ms {
@@ -346,7 +385,18 @@ impl Storage {
                 }
                 out_ts.push(t);
                 for (cidx, col) in seg.cols.iter().enumerate() {
-                    out_cols[cidx].push(col[i]);
+                    match (&mut out_cols[cidx], col) {
+                        (ColumnData::F64(dst), ColumnData::F64(src)) => dst.push(src[i]),
+                        (ColumnData::I64(dst), ColumnData::I64(src)) => dst.push(src[i]),
+                        (ColumnData::Bool(dst), ColumnData::Bool(src)) => dst.push(src[i]),
+                        (ColumnData::Utf8(dst), ColumnData::Utf8(src)) => dst.push(src[i].clone()),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "column type mismatch",
+                            ))
+                        }
+                    }
                 }
             }
         }
@@ -377,7 +427,16 @@ impl Storage {
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         let mut acc_ts: Vec<i64> = Vec::new();
-        let mut acc_cols: Vec<Vec<f64>> = schema.columns.iter().map(|_| Vec::new()).collect();
+        let mut acc_cols: Vec<ColumnData> = schema
+            .columns
+            .iter()
+            .map(|col| match col.col_type {
+                ColumnType::F64 => ColumnData::F64(Vec::new()),
+                ColumnType::I64 => ColumnData::I64(Vec::new()),
+                ColumnType::Bool => ColumnData::Bool(Vec::new()),
+                ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+            })
+            .collect();
         let mut acc_min_seq: u64 = 0;
         let mut acc_max_seq: u64 = 0;
         let mut new_segments: Vec<Vec<u8>> = Vec::new();
@@ -407,7 +466,18 @@ impl Storage {
                 }
                 acc_ts.push(t);
                 for (cidx, col) in seg.cols.iter().enumerate() {
-                    acc_cols[cidx].push(col[i]);
+                    match (&mut acc_cols[cidx], col) {
+                        (ColumnData::F64(dst), ColumnData::F64(src)) => dst.push(src[i]),
+                        (ColumnData::I64(dst), ColumnData::I64(src)) => dst.push(src[i]),
+                        (ColumnData::Bool(dst), ColumnData::Bool(src)) => dst.push(src[i]),
+                        (ColumnData::Utf8(dst), ColumnData::Utf8(src)) => dst.push(src[i].clone()),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "column type mismatch",
+                            ))
+                        }
+                    }
                 }
 
                 if acc_ts.len() >= target_segment_points {
@@ -421,7 +491,12 @@ impl Storage {
                     new_segments.push(bytes);
                     acc_ts.clear();
                     for c in &mut acc_cols {
-                        c.clear();
+                        match c {
+                            ColumnData::F64(v) => v.clear(),
+                            ColumnData::I64(v) => v.clear(),
+                            ColumnData::Bool(v) => v.clear(),
+                            ColumnData::Utf8(v) => v.clear(),
+                        }
                     }
                 }
             }
@@ -491,12 +566,20 @@ impl Storage {
         };
         let index = self.load_or_rebuild_table_index(table)?;
         if index.is_empty() {
+            let mut raw_value_bytes_per_row: u64 = 0;
+            for col in &schema.columns {
+                raw_value_bytes_per_row = raw_value_bytes_per_row.saturating_add(match col.col_type {
+                    ColumnType::F64 | ColumnType::I64 => 8,
+                    ColumnType::Bool => 1,
+                    ColumnType::Utf8 => 0,
+                });
+            }
             return Ok(TableStats {
                 rows: 0,
                 segments: 0,
                 columns: schema.columns.len() as u16,
                 raw_ts_bytes: 0,
-                raw_value_bytes: 0,
+                raw_value_bytes: 0 * raw_value_bytes_per_row,
                 stored_ts_bytes: 0,
                 stored_value_bytes: 0,
                 header_bytes: 0,
@@ -535,12 +618,20 @@ impl Storage {
         }
 
         let columns = schema.columns.len() as u16;
+        let mut raw_value_bytes_per_row: u64 = 0;
+        for col in &schema.columns {
+            raw_value_bytes_per_row = raw_value_bytes_per_row.saturating_add(match col.col_type {
+                ColumnType::F64 | ColumnType::I64 => 8,
+                ColumnType::Bool => 1,
+                ColumnType::Utf8 => 0,
+            });
+        }
         Ok(TableStats {
             rows,
             segments,
             columns,
             raw_ts_bytes: rows.saturating_mul(8),
-            raw_value_bytes: rows.saturating_mul(8).saturating_mul(columns as u64),
+            raw_value_bytes: rows.saturating_mul(raw_value_bytes_per_row),
             stored_ts_bytes,
             stored_value_bytes,
             header_bytes,
@@ -582,7 +673,7 @@ struct TableSegment {
     min_seq: u64,
     max_seq: u64,
     ts_ms: Vec<i64>,
-    cols: Vec<Vec<f64>>,
+    cols: Vec<ColumnData>,
 }
 
 
@@ -604,7 +695,7 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
     }
     let ver = read_exact(&mut data, 1)?[0];
-    if ver != TABLE_VERSION {
+    if ver != 1 && ver != TABLE_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
     }
 
@@ -639,28 +730,134 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
         return Err(io::Error::new(io::ErrorKind::InvalidData, "schema mismatch"));
     }
 
-    let mut cols: Vec<Vec<f64>> = Vec::with_capacity(ncols);
-    for _ in 0..ncols {
+    let mut cols: Vec<ColumnData> = Vec::with_capacity(ncols);
+    for col in &schema.columns {
+        let null_bytes = if ver == 1 {
+            Vec::new()
+        } else {
+            let null_len = u32::from_le_bytes(read_exact(&mut data, 4)?.try_into().unwrap()) as usize;
+            if null_len > 0 {
+                read_exact(&mut data, null_len)?.to_vec()
+            } else {
+                Vec::new()
+            }
+        };
+
         let ccodec = read_exact(&mut data, 1)?[0];
         let clen = u32::from_le_bytes(read_exact(&mut data, 4)?.try_into().unwrap()) as usize;
-        match ccodec {
-            TABLE_COL_F64_XOR => {
-                let blob = read_exact(&mut data, clen)?;
-                let col = decompress_f64_xor(blob, count)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                cols.push(col);
+        let blob = read_exact(&mut data, clen)?;
+
+        match col.col_type {
+            ColumnType::F64 => {
+                let values: Vec<f64> = match ccodec {
+                    TABLE_COL_F64_XOR => {
+                        decompress_f64_xor(blob, count)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    }
+                    TABLE_COL_I64_D2 => {
+                        let ints = TimeSeriesCompressor::decompress(blob)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        if ints.len() != count {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "col count mismatch",
+                            ));
+                        }
+                        ints.into_iter().map(|x| x as f64).collect()
+                    }
+                    _ => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"))
+                    }
+                };
+                if values.len() != count {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "col count mismatch"));
+                }
+                let mut out: Vec<Option<f64>> = Vec::with_capacity(count);
+                for i in 0..count {
+                    if null_bytes.is_empty() || is_valid(&null_bytes, i) {
+                        out.push(Some(values[i]));
+                    } else {
+                        out.push(None);
+                    }
+                }
+                cols.push(ColumnData::F64(out));
             }
-            TABLE_COL_I64_D2 => {
-                let blob = read_exact(&mut data, clen)?;
+            ColumnType::I64 => {
+                if ccodec != TABLE_COL_I64_D2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
                 let ints = TimeSeriesCompressor::decompress(blob)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if ints.len() != count {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "col count mismatch"));
                 }
-                cols.push(ints.into_iter().map(|x| x as f64).collect());
+                let mut out: Vec<Option<i64>> = Vec::with_capacity(count);
+                for i in 0..count {
+                    if null_bytes.is_empty() || is_valid(&null_bytes, i) {
+                        out.push(Some(ints[i]));
+                    } else {
+                        out.push(None);
+                    }
+                }
+                cols.push(ColumnData::I64(out));
             }
-            _ => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+            ColumnType::Bool => {
+                if ccodec != TABLE_COL_BOOL {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
+                if blob.len() != count {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "col count mismatch"));
+                }
+                let mut out: Vec<Option<bool>> = Vec::with_capacity(count);
+                for i in 0..count {
+                    if null_bytes.is_empty() || is_valid(&null_bytes, i) {
+                        out.push(Some(blob[i] != 0));
+                    } else {
+                        out.push(None);
+                    }
+                }
+                cols.push(ColumnData::Bool(out));
+            }
+            ColumnType::Utf8 => {
+                if ccodec != TABLE_COL_UTF8 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
+                let need_offsets = (count + 1)
+                    .checked_mul(4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
+                if blob.len() < need_offsets {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "short utf8 column",
+                    ));
+                }
+                let mut offsets: Vec<u32> = Vec::with_capacity(count + 1);
+                for i in 0..=count {
+                    let start = i * 4;
+                    let off = u32::from_le_bytes(blob[start..start + 4].try_into().unwrap());
+                    offsets.push(off);
+                }
+                let data_bytes = &blob[need_offsets..];
+                let mut out: Vec<Option<String>> = Vec::with_capacity(count);
+                for i in 0..count {
+                    if !null_bytes.is_empty() && !is_valid(&null_bytes, i) {
+                        out.push(None);
+                        continue;
+                    }
+                    let start = offsets[i] as usize;
+                    let end = offsets[i + 1] as usize;
+                    if start > end || end > data_bytes.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "bad utf8 offsets",
+                        ));
+                    }
+                    let s = std::str::from_utf8(&data_bytes[start..end]).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bad utf8 data")
+                    })?;
+                    out.push(Some(s.to_string()));
+                }
+                cols.push(ColumnData::Utf8(out));
             }
         }
     }
@@ -674,40 +871,80 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
 }
 
 
-fn compress_f64_column_auto(col: &[f64]) -> (u8, Vec<u8>) {
+fn compress_f64_column_auto(col: &[Option<f64>]) -> (u8, Vec<u8>) {
     if let Some(ints) = try_f64_column_as_i64(col) {
         return (TABLE_COL_I64_D2, TimeSeriesCompressor::compress(&ints));
     }
-    (TABLE_COL_F64_XOR, compress_f64_xor(col))
+    let mut raw: Vec<f64> = Vec::with_capacity(col.len());
+    for v in col {
+        raw.push(v.unwrap_or(0.0));
+    }
+    (TABLE_COL_F64_XOR, compress_f64_xor(&raw))
 }
 
-fn try_f64_column_as_i64(col: &[f64]) -> Option<Vec<i64>> {
+fn try_f64_column_as_i64(col: &[Option<f64>]) -> Option<Vec<i64>> {
     if col.is_empty() {
         return Some(Vec::new());
     }
     let mut out: Vec<i64> = Vec::with_capacity(col.len());
-    for &v in col {
-        if !v.is_finite() {
-            return None;
+    for v in col {
+        match v {
+            None => out.push(0),
+            Some(v) => {
+                if !v.is_finite() {
+                    return None;
+                }
+                // Treat -0.0 as non-integer to preserve bitwise roundtrip behavior.
+                if *v == 0.0 && v.is_sign_negative() {
+                    return None;
+                }
+                // Require exact integer representable as i64 -> f64 roundtrip.
+                if v.fract() != 0.0 {
+                    return None;
+                }
+                if *v < (i64::MIN as f64) || *v > (i64::MAX as f64) {
+                    return None;
+                }
+                let i = *v as i64;
+                if (i as f64) != *v {
+                    return None;
+                }
+                out.push(i);
+            }
         }
-        // Treat -0.0 as non-integer to preserve bitwise roundtrip behavior.
-        if v == 0.0 && v.is_sign_negative() {
-            return None;
-        }
-        // Require exact integer representable as i64 -> f64 roundtrip.
-        if v.fract() != 0.0 {
-            return None;
-        }
-        if v < (i64::MIN as f64) || v > (i64::MAX as f64) {
-            return None;
-        }
-        let i = v as i64;
-        if (i as f64) != v {
-            return None;
-        }
-        out.push(i);
     }
     Some(out)
+}
+
+fn build_null_bitmap<T>(values: &[Option<T>]) -> Option<Vec<u8>> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut any_null = false;
+    let mut out = vec![0u8; (values.len() + 7) / 8];
+    for (i, v) in values.iter().enumerate() {
+        if v.is_some() {
+            let byte = i / 8;
+            let bit = i % 8;
+            out[byte] |= 1u8 << bit;
+        } else {
+            any_null = true;
+        }
+    }
+    if any_null {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn is_valid(bitmap: &[u8], idx: usize) -> bool {
+    let byte = idx / 8;
+    let bit = idx % 8;
+    if byte >= bitmap.len() {
+        return false;
+    }
+    (bitmap[byte] >> bit) & 1 == 1
 }
 
 fn encode_table_schema_bytes(schema: &TableSchema) -> io::Result<Vec<u8>> {
@@ -726,12 +963,13 @@ fn encode_table_schema_bytes(schema: &TableSchema) -> io::Result<Vec<u8>> {
     out.push(SCHEMA_VERSION);
     out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
     for col in &schema.columns {
-        let b = col.as_bytes();
+        let b = col.name.as_bytes();
         if b.len() > u16::MAX as usize {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "column name too long"));
         }
         out.extend_from_slice(&(b.len() as u16).to_le_bytes());
         out.extend_from_slice(b);
+        out.push(col.col_type.to_tag());
     }
     Ok(out)
 }
@@ -740,7 +978,11 @@ fn decode_table_schema_bytes(data: &[u8]) -> io::Result<TableSchema> {
     if data.len() < 7 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short schema header"));
     }
-    if &data[0..4] != SCHEMA_MAGIC || data[4] != SCHEMA_VERSION {
+    if &data[0..4] != SCHEMA_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad schema header"));
+    }
+    let version = data[4];
+    if version != 1 && version != SCHEMA_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad schema header"));
     }
     let mut pos = 5usize;
@@ -760,7 +1002,21 @@ fn decode_table_schema_bytes(data: &[u8]) -> io::Result<TableSchema> {
         pos += len;
         let s = String::from_utf8(b)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad column utf-8"))?;
-        columns.push(s);
+        let col_type = if version == 1 {
+            ColumnType::F64
+        } else {
+            if data.len() <= pos {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "short schema"));
+            }
+            let tag = data[pos];
+            pos += 1;
+            ColumnType::from_tag(tag)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad column type"))?
+        };
+        columns.push(ColumnSchema {
+            name: s,
+            col_type,
+        });
     }
     Ok(TableSchema { columns })
 }
@@ -794,7 +1050,7 @@ fn decode_name_prefix(payload: &[u8]) -> io::Result<(String, &[u8])> {
 fn encode_table_segment(
     schema: &TableSchema,
     ts_ms: &[i64],
-    cols: &[Vec<f64>],
+    cols: &[ColumnData],
     min_seq: u64,
     max_seq: u64,
 ) -> io::Result<Vec<u8>> {
@@ -805,7 +1061,13 @@ fn encode_table_segment(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "schema mismatch"));
     }
     for c in cols {
-        if c.len() != ts_ms.len() {
+        let len = match c {
+            ColumnData::F64(v) => v.len(),
+            ColumnData::I64(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::Utf8(v) => v.len(),
+        };
+        if len != ts_ms.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "column length mismatch"));
         }
     }
@@ -832,11 +1094,84 @@ fn encode_table_segment(
     out.extend_from_slice(&(ts_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&ts_bytes);
     out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
-    for col in cols {
-        let (codec, blob) = compress_f64_column_auto(col);
-        out.push(codec);
-        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        out.extend_from_slice(&blob);
+    for (col, schema_col) in cols.iter().zip(schema.columns.iter()) {
+        match (col, schema_col.col_type) {
+            (ColumnData::F64(values), ColumnType::F64) => {
+                let nulls = build_null_bitmap(values);
+                let (codec, blob) = compress_f64_column_auto(values);
+                if let Some(nulls) = nulls {
+                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&nulls);
+                } else {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                }
+                out.push(codec);
+                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                out.extend_from_slice(&blob);
+            }
+            (ColumnData::I64(values), ColumnType::I64) => {
+                let nulls = build_null_bitmap(values);
+                let mut raw: Vec<i64> = Vec::with_capacity(values.len());
+                for v in values {
+                    raw.push(v.unwrap_or(0));
+                }
+                let blob = TimeSeriesCompressor::compress(&raw);
+                if let Some(nulls) = nulls {
+                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&nulls);
+                } else {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                }
+                out.push(TABLE_COL_I64_D2);
+                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                out.extend_from_slice(&blob);
+            }
+            (ColumnData::Bool(values), ColumnType::Bool) => {
+                let nulls = build_null_bitmap(values);
+                let mut raw: Vec<u8> = Vec::with_capacity(values.len());
+                for v in values {
+                    raw.push(u8::from(v.unwrap_or(false)));
+                }
+                if let Some(nulls) = nulls {
+                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&nulls);
+                } else {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                }
+                out.push(TABLE_COL_BOOL);
+                out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+                out.extend_from_slice(&raw);
+            }
+            (ColumnData::Utf8(values), ColumnType::Utf8) => {
+                let nulls = build_null_bitmap(values);
+                let mut offsets: Vec<u32> = Vec::with_capacity(values.len() + 1);
+                let mut data_bytes: Vec<u8> = Vec::new();
+                offsets.push(0);
+                for v in values {
+                    if let Some(s) = v {
+                        data_bytes.extend_from_slice(s.as_bytes());
+                    }
+                    offsets.push(data_bytes.len() as u32);
+                }
+                let mut blob = Vec::with_capacity(offsets.len() * 4 + data_bytes.len());
+                for off in offsets {
+                    blob.extend_from_slice(&off.to_le_bytes());
+                }
+                blob.extend_from_slice(&data_bytes);
+                if let Some(nulls) = nulls {
+                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&nulls);
+                } else {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                }
+                out.push(TABLE_COL_UTF8);
+                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                out.extend_from_slice(&blob);
+            }
+            _ => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "schema mismatch"));
+            }
+        }
     }
     Ok(out)
 }
@@ -863,7 +1198,7 @@ fn table_segment_storage_stats(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
     }
     let ver = read_exact(1)?[0];
-    if ver != TABLE_VERSION {
+    if ver != 1 && ver != TABLE_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
     }
 
@@ -898,15 +1233,34 @@ fn table_segment_storage_stats(
 
     let mut stored_value_bytes = 0u64;
     for _ in 0..ncols {
-        let ccodec = read_exact(1)?[0];
-        header_bytes += 1;
-        if ccodec != TABLE_COL_F64_XOR && ccodec != TABLE_COL_I64_D2 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+        if ver == 1 {
+            let ccodec = read_exact(1)?[0];
+            header_bytes += 1;
+            if ccodec != TABLE_COL_F64_XOR && ccodec != TABLE_COL_I64_D2 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+            }
+            let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
+            header_bytes += 4;
+            stored_value_bytes += clen;
+            let _ = read_exact(clen as usize)?;
+        } else {
+            let null_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
+            header_bytes += 4 + null_len;
+            let _ = read_exact(null_len as usize)?;
+            let ccodec = read_exact(1)?[0];
+            header_bytes += 1;
+            if ccodec != TABLE_COL_F64_XOR
+                && ccodec != TABLE_COL_I64_D2
+                && ccodec != TABLE_COL_BOOL
+                && ccodec != TABLE_COL_UTF8
+            {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+            }
+            let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
+            header_bytes += 4;
+            stored_value_bytes += clen;
+            let _ = read_exact(clen as usize)?;
         }
-        let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
-        header_bytes += 4;
-        stored_value_bytes += clen;
-        let _ = read_exact(clen as usize)?;
     }
 
     Ok((count, ts_len, stored_value_bytes, header_bytes))
@@ -928,7 +1282,7 @@ fn parse_table_segment_header(data: &[u8]) -> io::Result<TableSegmentHeader> {
     if &data[0..4] != TABLE_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
     }
-    if data[4] != TABLE_VERSION {
+    if data[4] != 1 && data[4] != TABLE_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
     }
     let min_seq = u64::from_le_bytes(data[5..13].try_into().unwrap());
@@ -1263,24 +1617,39 @@ mod tests {
     fn test_table_segment_roundtrip_xor() {
         let path = fresh_db_path("table_seg");
         let storage = Storage::open(&path).unwrap();
-        let schema = TableSchema {
-            columns: vec!["a".into(), "b".into()],
-        };
+        let schema = TableSchema::f64_columns(&["a", "b"]);
         storage.write_table_schema("t", &schema).unwrap();
 
         let ts: Vec<i64> = (0..4096).map(|i| 1_000_000 + i as i64).collect();
         let col_a: Vec<f64> = (0..4096).map(|i| i as f64 * 0.1).collect();
         let col_b: Vec<f64> = (0..4096).map(|i| (i % 17) as f64).collect();
+        let col_a: Vec<Option<f64>> = col_a.into_iter().map(Some).collect();
+        let col_b: Vec<Option<f64>> = col_b.into_iter().map(Some).collect();
         storage
-            .append_table_segment("t", &schema, &ts, &[col_a.clone(), col_b.clone()], 1, 4096)
+            .append_table_segment(
+                "t",
+                &schema,
+                &ts,
+                &[
+                    ColumnData::F64(col_a.clone()),
+                    ColumnData::F64(col_b.clone()),
+                ],
+                1,
+                4096,
+            )
             .unwrap();
 
         let (out_ts, out_cols) = storage
             .read_table_columns_in_range("t", &schema, ts[100], ts[200])
             .unwrap();
         assert_eq!(out_cols.len(), 2);
-        assert_eq!(out_ts.len(), out_cols[0].len());
-        assert_eq!(out_ts.len(), out_cols[1].len());
+        match (&out_cols[0], &out_cols[1]) {
+            (ColumnData::F64(a), ColumnData::F64(b)) => {
+                assert_eq!(out_ts.len(), a.len());
+                assert_eq!(out_ts.len(), b.len());
+            }
+            _ => panic!("unexpected column type"),
+        }
         assert!(out_ts[0] >= ts[100] && *out_ts.last().unwrap() <= ts[200]);
         let _ = fs::remove_file(path);
     }
@@ -1289,16 +1658,23 @@ mod tests {
     fn test_table_stats_basic() {
         let path = fresh_db_path("stats");
         let storage = Storage::open(&path).unwrap();
-        let schema = TableSchema {
-            columns: vec!["a".into(), "b".into()],
-        };
+        let schema = TableSchema::f64_columns(&["a", "b"]);
         storage.write_table_schema("t", &schema).unwrap();
 
         let ts: Vec<i64> = (0..1024).map(|i| 123_000 + i as i64).collect();
         let col_a: Vec<f64> = (0..1024).map(|i| i as f64).collect();
         let col_b: Vec<f64> = (0..1024).map(|i| (i % 11) as f64).collect();
+        let col_a: Vec<Option<f64>> = col_a.into_iter().map(Some).collect();
+        let col_b: Vec<Option<f64>> = col_b.into_iter().map(Some).collect();
         storage
-            .append_table_segment("t", &schema, &ts, &[col_a, col_b], 1, 1024)
+            .append_table_segment(
+                "t",
+                &schema,
+                &ts,
+                &[ColumnData::F64(col_a), ColumnData::F64(col_b)],
+                1,
+                1024,
+            )
             .unwrap();
 
         let st = storage.table_stats("t").unwrap();
@@ -1315,15 +1691,14 @@ mod tests {
     fn test_integer_column_uses_i64_codec() {
         let path = fresh_db_path("i64_codec");
         let storage = Storage::open(&path).unwrap();
-        let schema = TableSchema {
-            columns: vec!["value".into()],
-        };
+        let schema = TableSchema::f64_columns(&["value"]);
         storage.write_table_schema("t", &schema).unwrap();
 
         let ts: Vec<i64> = (0..1024).map(|i| 1000 + i as i64).collect();
         let col: Vec<f64> = (0..1024).map(|i| i as f64).collect();
+        let col: Vec<Option<f64>> = col.into_iter().map(Some).collect();
         storage
-            .append_table_segment("t", &schema, &ts, &[col.clone()], 1, 1024)
+            .append_table_segment("t", &schema, &ts, &[ColumnData::F64(col.clone())], 1, 1024)
             .unwrap();
 
         let idx = storage.load_or_rebuild_table_index("t").unwrap();
@@ -1353,6 +1728,10 @@ mod tests {
         let ncols = u16::from_le_bytes(take(&mut data, 2).try_into().unwrap());
         assert_eq!(ncols, 1);
 
+        let null_len = u32::from_le_bytes(take(&mut data, 4).try_into().unwrap()) as usize;
+        if null_len > 0 {
+            let _ = take(&mut data, null_len);
+        }
         let codec = take(&mut data, 1)[0];
         assert_eq!(codec, TABLE_COL_I64_D2);
 
@@ -1362,9 +1741,14 @@ mod tests {
             .unwrap();
         assert_eq!(out_ts.len(), ts.len());
         assert_eq!(out_cols.len(), 1);
-        assert_eq!(out_cols[0].len(), ts.len());
-        for (a, b) in out_cols[0].iter().zip(col.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits());
+        match &out_cols[0] {
+            ColumnData::F64(values) => {
+                assert_eq!(values.len(), ts.len());
+                for (a, b) in values.iter().zip(col.iter()) {
+                    assert_eq!(a.unwrap().to_bits(), b.unwrap().to_bits());
+                }
+            }
+            _ => panic!("unexpected column type"),
         }
 
         let _ = fs::remove_file(path);

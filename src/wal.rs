@@ -5,9 +5,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const WAL_MAGIC: &[u8; 4] = b"NTWL";
-const WAL_VERSION: u8 = 1;
+const WAL_VERSION: u8 = 2;
 const RECORD_APPEND: u8 = 1;
 const RECORD_APPEND_ROW: u8 = 2;
+const RECORD_APPEND_ROW_TYPED: u8 = 3;
+const WAL_VAL_NULL: u8 = 0;
+const WAL_VAL_F64: u8 = 1;
+const WAL_VAL_I64: u8 = 2;
+const WAL_VAL_BOOL: u8 = 3;
+const WAL_VAL_UTF8: u8 = 4;
 
 #[derive(Debug)]
 pub struct Wal {
@@ -28,6 +34,12 @@ pub enum WalRecord<'a> {
         ts_ms: i64,
         values: &'a [f64],
     },
+    AppendRowTyped {
+        seq: u64,
+        table: &'a str,
+        ts_ms: i64,
+        values: &'a [WalValue<'a>],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +56,21 @@ pub enum WalRecordOwned {
         ts_ms: i64,
         values: Vec<f64>,
     },
+    AppendRowTyped {
+        seq: u64,
+        table: String,
+        ts_ms: i64,
+        values: Vec<crate::db::Value>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WalValue<'a> {
+    Null,
+    F64(f64),
+    I64(i64),
+    Bool(bool),
+    Utf8(&'a str),
 }
 
 impl Wal {
@@ -108,6 +135,61 @@ impl Wal {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
             }
+            WalRecord::AppendRowTyped {
+                seq,
+                table,
+                ts_ms,
+                values,
+            } => {
+                payload.push(RECORD_APPEND_ROW_TYPED);
+                payload.extend_from_slice(&seq.to_le_bytes());
+                let table_bytes = table.as_bytes();
+                if table_bytes.len() > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "table name too long",
+                    ));
+                }
+                if values.len() > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "too many columns",
+                    ));
+                }
+                payload.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
+                payload.extend_from_slice(table_bytes);
+                payload.extend_from_slice(&ts_ms.to_le_bytes());
+                payload.extend_from_slice(&(values.len() as u16).to_le_bytes());
+                for v in values {
+                    match v {
+                        WalValue::Null => payload.push(WAL_VAL_NULL),
+                        WalValue::F64(x) => {
+                            payload.push(WAL_VAL_F64);
+                            payload.extend_from_slice(&x.to_le_bytes());
+                        }
+                        WalValue::I64(x) => {
+                            payload.push(WAL_VAL_I64);
+                            payload.extend_from_slice(&x.to_le_bytes());
+                        }
+                        WalValue::Bool(x) => {
+                            payload.push(WAL_VAL_BOOL);
+                            payload.push(u8::from(*x));
+                        }
+                        WalValue::Utf8(s) => {
+                            payload.push(WAL_VAL_UTF8);
+                            let bytes = s.as_bytes();
+                            if bytes.len() > u32::MAX as usize {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "string too long",
+                                ));
+                            }
+                            payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                            payload.extend_from_slice(bytes);
+                        }
+                    }
+                }
+            }
         }
 
         let _ = dbfile::append_record(&self.db_path, dbfile::RECORD_WAL, &payload)?;
@@ -153,10 +235,17 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
     if payload.len() < 6 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short WAL payload"));
     }
-    if &payload[0..4] != WAL_MAGIC || payload[4] != WAL_VERSION {
+    if &payload[0..4] != WAL_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid WAL record header",
+        ));
+    }
+    let version = payload[4];
+    if version != 1 && version != WAL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported WAL version",
         ));
     }
     let mut pos = 5usize;
@@ -218,6 +307,111 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             })?;
 
             Ok(WalRecordOwned::AppendRow {
+                seq,
+                table: table.to_string(),
+                ts_ms,
+                values,
+            })
+        }
+        RECORD_APPEND_ROW_TYPED => {
+            if version == 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "typed WAL record not supported in v1",
+                ));
+            }
+            let seq = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let table_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let table_bytes = &payload[pos..pos + table_len];
+            pos += table_len;
+            let ts_ms = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let ncols = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+
+            let mut values: Vec<crate::db::Value> = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                if payload.len() <= pos {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "short typed WAL payload",
+                    ));
+                }
+                let tag = payload[pos];
+                pos += 1;
+                match tag {
+                    WAL_VAL_NULL => values.push(crate::db::Value::Null),
+                    WAL_VAL_F64 => {
+                        if payload.len() < pos + 8 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "short typed WAL payload",
+                            ));
+                        }
+                        let v = f64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+                        pos += 8;
+                        values.push(crate::db::Value::F64(v));
+                    }
+                    WAL_VAL_I64 => {
+                        if payload.len() < pos + 8 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "short typed WAL payload",
+                            ));
+                        }
+                        let v = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+                        pos += 8;
+                        values.push(crate::db::Value::I64(v));
+                    }
+                    WAL_VAL_BOOL => {
+                        if payload.len() < pos + 1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "short typed WAL payload",
+                            ));
+                        }
+                        let v = payload[pos] != 0;
+                        pos += 1;
+                        values.push(crate::db::Value::Bool(v));
+                    }
+                    WAL_VAL_UTF8 => {
+                        if payload.len() < pos + 4 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "short typed WAL payload",
+                            ));
+                        }
+                        let len =
+                            u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+                        pos += 4;
+                        if payload.len() < pos + len {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "short typed WAL payload",
+                            ));
+                        }
+                        let s = std::str::from_utf8(&payload[pos..pos + len]).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8")
+                        })?;
+                        pos += len;
+                        values.push(crate::db::Value::Utf8(s.to_string()));
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unknown typed WAL value tag",
+                        ))
+                    }
+                }
+            }
+
+            let table = std::str::from_utf8(table_bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid table utf-8")
+            })?;
+
+            Ok(WalRecordOwned::AppendRowTyped {
                 seq,
                 table: table.to_string(),
                 ts_ms,

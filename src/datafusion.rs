@@ -2,7 +2,7 @@
 //
 // DataFusion integration (read-only SQL).
 
-use crate::db::NanoTsDb;
+use crate::db::{ColumnType, NanoTsDb};
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -171,8 +171,13 @@ fn build_table_schema(db: &NanoTsDb, table: &str) -> DFResult<SchemaRef> {
     let mut fields = Vec::with_capacity(2 + schema.columns.len());
     fields.push(Field::new("ts", DataType::Int64, false));
     fields.push(Field::new("ts_ms", DataType::Int64, false));
-    for name in schema.columns {
-        fields.push(Field::new(&name, DataType::Float64, false));
+    for col in schema.columns {
+        if col.col_type != ColumnType::F64 {
+            return Err(DataFusionError::Execution(
+                "only Float64 columns are supported in DataFusion for now".to_string(),
+            ));
+        }
+        fields.push(Field::new(&col.name, DataType::Float64, true));
     }
     Ok(Arc::new(Schema::new(fields)))
 }
