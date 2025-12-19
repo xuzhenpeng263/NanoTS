@@ -5,9 +5,8 @@ use crate::wal::{Wal, WalRecord, WalRecordOwned, WalValue};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(feature = "datafusion")]
-use std::sync::Arc;
 
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -295,6 +294,40 @@ pub struct NanoTsDb {
     next_seq: u64,
     options: NanoTsOptions,
     tables: HashMap<String, TableBuffer>,
+}
+
+#[derive(Clone)]
+pub struct NanoTsDbShared {
+    inner: Arc<RwLock<NanoTsDb>>,
+}
+
+impl NanoTsDbShared {
+    pub fn open(root: impl AsRef<Path>, options: NanoTsOptions) -> io::Result<Self> {
+        let db = NanoTsDb::open(root, options)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(db)),
+        })
+    }
+
+    pub fn with_read<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&NanoTsDb) -> io::Result<R>,
+    {
+        let guard = self.inner.read().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "db read lock poisoned")
+        })?;
+        f(&guard)
+    }
+
+    pub fn with_write<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut NanoTsDb) -> io::Result<R>,
+    {
+        let mut guard = self.inner.write().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "db write lock poisoned")
+        })?;
+        f(&mut guard)
+    }
 }
 
 impl NanoTsDb {
@@ -1333,6 +1366,95 @@ mod tests {
                 _ => panic!("unexpected column type"),
             }
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_wal_replay_typed_values() {
+        let path = fresh_db_path("wal_typed");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table_typed(
+                "t",
+                &[
+                    ("a", ColumnType::I64),
+                    ("b", ColumnType::Bool),
+                    ("c", ColumnType::Utf8),
+                ],
+            )
+            .unwrap();
+            db.append_row_typed(
+                "t",
+                1000,
+                &[
+                    Value::I64(7),
+                    Value::Bool(true),
+                    Value::Utf8("ok".to_string()),
+                ],
+            )
+            .unwrap();
+            // Drop without flush to force WAL replay.
+        }
+        {
+            let db = NanoTsDb::open(&path, opts).unwrap();
+            let (ts, cols) = db.query_table_range_typed("t", 0, 10_000).unwrap();
+            assert_eq!(ts, vec![1000]);
+            match &cols[0] {
+                ColumnData::I64(values) => assert_eq!(values[0], Some(7)),
+                _ => panic!("unexpected column type"),
+            }
+            match &cols[1] {
+                ColumnData::Bool(values) => assert_eq!(values[0], Some(true)),
+                _ => panic!("unexpected column type"),
+            }
+            match &cols[2] {
+                ColumnData::Utf8(values) => assert_eq!(values[0].as_deref(), Some("ok")),
+                _ => panic!("unexpected column type"),
+            }
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_shared_read_write() {
+        let path = fresh_db_path("shared_rw");
+        let opts = NanoTsOptions::default();
+        let db = NanoTsDbShared::open(&path, opts.clone()).unwrap();
+        db.with_write(|db| db.create_table("t", &["v"]))
+            .unwrap();
+
+        let writer = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                db.with_write(|db| {
+                    for i in 0..100i64 {
+                        db.append_row("t", 1_000 + i, &[i as f64])?;
+                    }
+                    db.flush()
+                })
+                .unwrap();
+            })
+        };
+
+        let reader = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                db.with_read(|db| {
+                    let _ = db.query_table_range_columns("t", 0, 10_000)?;
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let db = NanoTsDb::open(&path, opts).unwrap();
+        let (ts, cols) = db.query_table_range_columns("t", 0, 10_000).unwrap();
+        assert_eq!(ts.len(), cols[0].len());
+        assert!(ts.len() >= 100);
         let _ = fs::remove_file(path);
     }
 }
