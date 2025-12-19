@@ -4,7 +4,7 @@
 
 - **许可证**：AGPL-3.0-or-later
 - **定位**：类似 SQLite 的单机/边缘侧 TSDB Kernel（不是分布式集群）
-- **文档**：English（`README.md`、`CONTRIBUTING.md`、`SPEC.md`）、中文（`README.zh-CN.md`、`CONTRIBUTING.zh-CN.md`、`SPEC.zh-CN.md`）
+- **文档**：English（[README.md](README.md)、[CONTRIBUTING.md](CONTRIBUTING.md)、[SPEC.md](SPEC.md)）、中文（[README.zh-CN.md](README.zh-CN.md)、[CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)、[SPEC.zh-CN.md](SPEC.zh-CN.md)）
 
 ## 状态与兼容性
 
@@ -48,7 +48,7 @@
 - Rust 内核：`src/`（crate 名：`nanots`）
 - C 头文件：`include/nanots.h`
 - Python 绑定（独立 crate）：`python/nanots-py/`
-- 文件格式规范：`SPEC.md`
+- 文件格式规范：[SPEC.md](SPEC.md)
 
 ## 数据模型
 
@@ -58,7 +58,7 @@
 说明：
 
 - `append(series, ts_ms, value)` 是便捷接口，本质是写单列 table。
-- Schema 写入 `.ntt` 单文件中（见 `SPEC.md`）。
+- Schema 写入 `.ntt` 单文件中（见 [SPEC.md](SPEC.md)）。
 
 ## Rust 用法（详细）
 
@@ -202,7 +202,7 @@ db.pack_table("sensor", 8192)
 
 ## 文件格式
 
-详见 `SPEC.md` / `SPEC.zh-CN.md`，包含单文件记录布局与各 payload 格式。
+详见 [SPEC.md](SPEC.md) / [SPEC.zh-CN.md](SPEC.zh-CN.md)，包含单文件记录布局与各 payload 格式。
 
 ## 构建与测试
 

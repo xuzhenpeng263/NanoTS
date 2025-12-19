@@ -4,7 +4,7 @@ An **embeddable**, **append-only**, **high-performance** time-series storage ker
 
 - **License**: AGPL-3.0-or-later
 - **Positioning**: SQLite-like *in-process* TSDB kernel (single-node, edge/embedded)
-- **Docs**: English (`README.md`, `CONTRIBUTING.md`, `SPEC.md`), 中文 (`README.zh-CN.md`, `CONTRIBUTING.zh-CN.md`, `SPEC.zh-CN.md`)
+- **Docs**: English ([README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SPEC.md](SPEC.md)), 中文 ([README.zh-CN.md](README.zh-CN.md), [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md), [SPEC.zh-CN.md](SPEC.zh-CN.md))
 
 ## Status & compatibility
 
@@ -48,7 +48,7 @@ These numbers are from local runs and synthetic data (perfect/smooth patterns). 
 - Rust kernel: `src/` (crate name: `nanots`)
 - C header: `include/nanots.h`
 - Python binding crate: `python/nanots-py/`
-- File format spec: `SPEC.md`
+- File format spec: [SPEC.md](SPEC.md)
 
 ## Data model
 
@@ -59,7 +59,7 @@ These numbers are from local runs and synthetic data (perfect/smooth patterns). 
 Notes:
 
 - `append(series, ts_ms, value)` is a convenience API that writes to a single-column table.
-- Schema is stored in the `.ntt` file (see `SPEC.md`).
+- Schema is stored in the `.ntt` file (see [SPEC.md](SPEC.md)).
 
 ## Rust usage (detailed)
 
@@ -203,7 +203,7 @@ db.pack_table("sensor", 8192)
 
 ## File format
 
-See `SPEC.md` for the single-file record layout and payload formats.
+See [SPEC.md](SPEC.md) for the single-file record layout and payload formats.
 
 ## Build & test
 
