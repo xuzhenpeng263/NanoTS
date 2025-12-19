@@ -1,0 +1,18 @@
+[package]
+name = "nanots-py"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+name = "nanots_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+nanots-core = { package = "nanots", path = "../..", default-features = false }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+[features]
+default = ["arrow"]
+# Enable Arrow C Data Interface export (and the Python capsule APIs built on top of it).
+arrow = ["nanots-core/arrow"]

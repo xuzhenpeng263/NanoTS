@@ -1,0 +1,30 @@
+[package]
+name = "nanots"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Embeddable, append-only time-series storage kernel (community edition)"
+
+[dependencies]
+# For parallel processing (updated to latest)
+rayon = "1.10"
+
+# For memory mapping and zero-copy operations
+memmap2 = "0.9"
+
+# For CPU feature detection
+raw-cpuid = "11"
+
+
+[dev-dependencies]
+criterion = "0.5"
+
+[lib]
+name = "nanots"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Apache Arrow C Data Interface export (no external Arrow crates required).
+arrow = []
