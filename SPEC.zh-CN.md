@@ -28,6 +28,7 @@
 - `4` = WAL Record
 - `5` = WAL Checkpoint
 - `6` = Series Segment（历史单列）
+- `7` = Table Index（持久化索引）
 
 ### Meta 记录（type = 1）
 
@@ -73,6 +74,14 @@ Payload：
 - `name_len`：u16
 - `name_bytes`：`name_len` bytes（UTF-8 序列名）
 - `segment_bytes`：见 **Series Segment Payload**
+
+### Table Index 记录（type = 7）
+
+Payload：
+
+- `name_len`：u16
+- `name_bytes`：`name_len` bytes（UTF-8 表名）
+- `index_bytes`：见 **Table Index Payload**
 
 ## Schema Payload
 
@@ -154,3 +163,21 @@ Segment header：
 说明：
 
 - Series 结构用于向后兼容和 benchmark；内核 API 统一使用 **tables**（包括名为 `value` 的单列表）。
+
+## Table Index Payload
+
+Header：
+
+- `magic`：4 bytes = `NTSI`
+- `version`：u8 = `1`
+- `entry_count`：u32
+
+接着重复 `entry_count` 次：
+
+- `offset`：u64（segment 在 `.ntt` 内的偏移）
+- `len`：u64（segment 字节长度）
+- `min_ts`：i64
+- `max_ts`：i64
+- `min_seq`：u64
+- `max_seq`：u64
+- `count`：u32（segment 行数）

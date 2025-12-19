@@ -26,6 +26,9 @@ const SCHEMA_VERSION: u8 = 1;
 const META_MAGIC: &[u8; 4] = b"NTSM";
 const META_VERSION: u8 = 1;
 
+const TABLE_INDEX_MAGIC: &[u8; 4] = b"NTSI";
+const TABLE_INDEX_VERSION: u8 = 1;
+
 #[derive(Debug, Clone)]
 pub struct Storage {
     path: PathBuf,
@@ -37,6 +40,7 @@ struct StorageState {
     schemas: HashMap<String, TableSchema>,
     schema_bytes: HashMap<String, u64>,
     table_index: HashMap<String, Vec<TableIndexEntry>>,
+    index_bytes: HashMap<String, u64>,
     max_seq: u64,
 }
 
@@ -187,7 +191,7 @@ impl Storage {
             dbfile::append_record(&self.path, dbfile::RECORD_TABLE_SEGMENT, &payload)?;
         let name_len = table.as_bytes().len() as u64;
         let segment_offset = record_offset + 5 + 2 + name_len;
-        let (min_ts, max_ts) = table_segment_stats(&segment_bytes)?;
+        let header = parse_table_segment_header(&segment_bytes)?;
 
         let mut state = self.state.lock().unwrap();
         state
@@ -197,10 +201,35 @@ impl Storage {
             .push(TableIndexEntry {
                 offset: segment_offset,
                 len: segment_bytes.len() as u64,
-                min_ts,
-                max_ts,
+                min_ts: header.min_ts,
+                max_ts: header.max_ts,
+                min_seq: header.min_seq,
+                max_seq: header.max_seq,
+                count: header.count,
             });
         state.max_seq = state.max_seq.max(min_seq).max(max_seq);
+        Ok(())
+    }
+
+    pub fn write_table_index(&self, table: &str) -> io::Result<()> {
+        let entries = {
+            let state = self.state.lock().unwrap();
+            state
+                .table_index
+                .get(table)
+                .cloned()
+                .unwrap_or_default()
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let index_bytes = encode_table_index_payload(&entries);
+        let payload = encode_named_payload(table, &index_bytes)?;
+        let _ = dbfile::append_record(&self.path, dbfile::RECORD_TABLE_INDEX, &payload)?;
+        let mut state = self.state.lock().unwrap();
+        state
+            .index_bytes
+            .insert(table.to_string(), payload.len() as u64);
         Ok(())
     }
 
@@ -406,6 +435,7 @@ impl Storage {
         rewrite_db_with_table_segments(&self.path, table, &new_segments)?;
         let new_state = scan_db_file(&self.path)?;
         *self.state.lock().unwrap() = new_state;
+        self.write_table_index(table)?;
         Ok(())
     }
 
@@ -429,14 +459,17 @@ impl Storage {
             if name != table {
                 return Ok(());
             }
-            let (min_ts, max_ts) = table_segment_stats(data)?;
+            let header = parse_table_segment_header(data)?;
             let name_len = name.as_bytes().len() as u64;
             let segment_offset = hdr.payload_offset + 2 + name_len;
             idx.push(TableIndexEntry {
                 offset: segment_offset,
                 len: data.len() as u64,
-                min_ts,
-                max_ts,
+                min_ts: header.min_ts,
+                max_ts: header.max_ts,
+                min_seq: header.min_seq,
+                max_seq: header.max_seq,
+                count: header.count,
             });
             Ok(())
         })?;
@@ -449,14 +482,13 @@ impl Storage {
 
     pub fn table_stats(&self, table: &str) -> io::Result<TableStats> {
         let schema = self.read_table_schema(table)?;
-        let schema_file_bytes = self
-            .state
-            .lock()
-            .unwrap()
-            .schema_bytes
-            .get(table)
-            .copied()
-            .unwrap_or(0);
+        let (schema_file_bytes, idx_file_bytes) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.schema_bytes.get(table).copied().unwrap_or(0),
+                state.index_bytes.get(table).copied().unwrap_or(0),
+            )
+        };
         let index = self.load_or_rebuild_table_index(table)?;
         if index.is_empty() {
             return Ok(TableStats {
@@ -469,7 +501,7 @@ impl Storage {
                 stored_value_bytes: 0,
                 header_bytes: 0,
                 ntt_file_bytes: 0,
-                idx_file_bytes: 0,
+                idx_file_bytes,
                 schema_file_bytes,
             });
         }
@@ -513,7 +545,7 @@ impl Storage {
             stored_value_bytes,
             header_bytes,
             ntt_file_bytes,
-            idx_file_bytes: 0,
+            idx_file_bytes,
             schema_file_bytes,
         })
     }
@@ -540,6 +572,9 @@ struct TableIndexEntry {
     len: u64,
     min_ts: i64,
     max_ts: i64,
+    min_seq: u64,
+    max_seq: u64,
+    count: u32,
 }
 
 #[derive(Debug)]
@@ -806,11 +841,6 @@ fn encode_table_segment(
     Ok(out)
 }
 
-fn table_segment_stats(data: &[u8]) -> io::Result<(i64, i64)> {
-    let header = parse_table_segment_header(data)?;
-    Ok((header.min_ts, header.max_ts))
-}
-
 fn table_segment_storage_stats(
     data: &[u8],
     expected_cols: usize,
@@ -1043,6 +1073,68 @@ fn decode_meta_payload(payload: &[u8]) -> io::Result<(u64, Option<i64>)> {
     Ok((last_seq, retention_ms))
 }
 
+fn encode_table_index_payload(entries: &[TableIndexEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 1 + 4 + entries.len() * (8 + 8 + 8 + 8 + 8 + 8 + 4));
+    out.extend_from_slice(TABLE_INDEX_MAGIC);
+    out.push(TABLE_INDEX_VERSION);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&e.offset.to_le_bytes());
+        out.extend_from_slice(&e.len.to_le_bytes());
+        out.extend_from_slice(&e.min_ts.to_le_bytes());
+        out.extend_from_slice(&e.max_ts.to_le_bytes());
+        out.extend_from_slice(&e.min_seq.to_le_bytes());
+        out.extend_from_slice(&e.max_seq.to_le_bytes());
+        out.extend_from_slice(&e.count.to_le_bytes());
+    }
+    out
+}
+
+fn decode_table_index_payload(payload: &[u8]) -> io::Result<Vec<TableIndexEntry>> {
+    let mut pos = 0usize;
+    let mut read_exact = |len: usize| -> io::Result<&[u8]> {
+        if payload.len() < pos + len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "index payload too short",
+            ));
+        }
+        let out = &payload[pos..pos + len];
+        pos += len;
+        Ok(out)
+    };
+
+    let magic = read_exact(4)?;
+    if magic != TABLE_INDEX_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad index magic"));
+    }
+    let version = read_exact(1)?[0];
+    if version != TABLE_INDEX_VERSION {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad index version"));
+    }
+    let count = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let offset = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        let len = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        let min_ts = i64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        let max_ts = i64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        let min_seq = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        let max_seq = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        let count = u32::from_le_bytes(read_exact(4)?.try_into().unwrap());
+        entries.push(TableIndexEntry {
+            offset,
+            len,
+            min_ts,
+            max_ts,
+            min_seq,
+            max_seq,
+            count,
+        });
+    }
+    Ok(entries)
+}
+
 fn scan_db_file(path: &Path) -> io::Result<StorageState> {
     let mut state = StorageState::default();
     dbfile::iter_records(path, |hdr, payload| {
@@ -1067,8 +1159,24 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
                         len: data.len() as u64,
                         min_ts: header.min_ts,
                         max_ts: header.max_ts,
+                        min_seq: header.min_seq,
+                        max_seq: header.max_seq,
+                        count: header.count,
                     });
                 state.max_seq = state.max_seq.max(header.min_seq).max(header.max_seq);
+            }
+            dbfile::RECORD_TABLE_INDEX => {
+                let (name, data) = decode_name_prefix(payload)?;
+                let entries = decode_table_index_payload(data)?;
+                for entry in &entries {
+                    state.max_seq = state
+                        .max_seq
+                        .max(entry.min_seq)
+                        .max(entry.max_seq);
+                }
+                state.table_index.insert(name.clone(), entries);
+                state.index_bytes
+                    .insert(name, hdr.payload_len as u64);
             }
             dbfile::RECORD_SERIES_SEGMENT => {
                 let (_, data) = decode_name_prefix(payload)?;
@@ -1099,6 +1207,12 @@ fn rewrite_db_with_table_segments(
     dbfile::create_new_db_file(&tmp)?;
     dbfile::iter_records(path, |hdr, payload| {
         if hdr.record_type == dbfile::RECORD_TABLE_SEGMENT {
+            let (name, _) = decode_name_prefix(payload)?;
+            if name == table {
+                return Ok(());
+            }
+        }
+        if hdr.record_type == dbfile::RECORD_TABLE_INDEX {
             let (name, _) = decode_name_prefix(payload)?;
             if name == table {
                 return Ok(());

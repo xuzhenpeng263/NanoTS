@@ -28,6 +28,7 @@ Record types:
 - `4` = WAL record
 - `5` = WAL checkpoint
 - `6` = Series segment (legacy single-column)
+- `7` = Table index (persisted)
 
 ### Meta record (type = 1)
 
@@ -73,6 +74,14 @@ Payload:
 - `name_len`: u16
 - `name_bytes`: `name_len` bytes (UTF-8 series name)
 - `segment_bytes`: see **Series segment payload** below
+
+### Table index record (type = 7)
+
+Payload:
+
+- `name_len`: u16
+- `name_bytes`: `name_len` bytes (UTF-8 table name)
+- `index_bytes`: see **Table index payload** below
 
 ## Schema payload
 
@@ -154,3 +163,21 @@ Value block:
 Notes:
 
 - Series layout is kept for backward compatibility and benchmarks; the kernel API uses **tables** (including 1-column tables named `value`).
+
+## Table index payload
+
+Header:
+
+- `magic`: 4 bytes = `NTSI`
+- `version`: u8 = `1`
+- `entry_count`: u32
+
+Then repeated `entry_count` times:
+
+- `offset`: u64 (segment offset inside `.ntt`)
+- `len`: u64 (segment length bytes)
+- `min_ts`: i64
+- `max_ts`: i64
+- `min_seq`: u64
+- `max_seq`: u64
+- `count`: u32 (rows in segment)

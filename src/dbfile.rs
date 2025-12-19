@@ -13,6 +13,7 @@ pub const RECORD_TABLE_SEGMENT: u8 = 3;
 pub const RECORD_WAL: u8 = 4;
 pub const RECORD_WAL_CHECKPOINT: u8 = 5;
 pub const RECORD_SERIES_SEGMENT: u8 = 6;
+pub const RECORD_TABLE_INDEX: u8 = 7;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RecordHeader {

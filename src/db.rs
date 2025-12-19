@@ -210,6 +210,9 @@ impl NanoTsDb {
         self.wal.flush()?;
         self.wal.reset()?;
         self.storage.write_meta(self.meta.last_seq, self.meta.retention_ms)?;
+        for t in self.tables.keys() {
+            self.storage.write_table_index(t)?;
+        }
         Ok(())
     }
 
@@ -490,6 +493,7 @@ mod tests {
     use super::*;
     use crate::dbfile;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     fn fresh_db_path(name: &str) -> PathBuf {
@@ -622,6 +626,23 @@ mod tests {
             assert!(ts.contains(&3000));
             assert!(ts.contains(&3001));
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_flush_writes_table_index() {
+        let path = fresh_db_path("index_record");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table("t", &["a"]).unwrap();
+            for i in 0..10i64 {
+                db.append_row("t", 1_000 + i, &[i as f64]).unwrap();
+            }
+            db.flush().unwrap();
+        }
+        let idx_count = count_records(&path, dbfile::RECORD_TABLE_INDEX).unwrap();
+        assert_eq!(idx_count, 1);
         let _ = fs::remove_file(path);
     }
 }
