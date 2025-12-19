@@ -12,6 +12,9 @@ pub mod wal;
 #[cfg(feature = "arrow")]
 pub mod arrow;
 
+#[cfg(feature = "datafusion")]
+pub mod datafusion;
+
 mod c_api;
 
 pub use crate::db::{NanoTsDb, NanoTsOptions, Point};

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "datafusion")]
+use std::sync::Arc;
 
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -283,6 +285,17 @@ impl NanoTsDb {
 
     pub fn last_seq(&self) -> u64 {
         self.meta.last_seq
+    }
+
+    #[cfg(feature = "datafusion")]
+    /// Execute a read-only SQL query via DataFusion.
+    ///
+    /// Requires the `datafusion` feature and runs in a single-threaded Tokio runtime.
+    pub fn query_sql(
+        self: &Arc<Self>,
+        sql: &str,
+    ) -> datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+        crate::datafusion::query_sql(self.clone(), sql)
     }
 
     pub fn compact_retention_now(&mut self) -> io::Result<()> {
