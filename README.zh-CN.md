@@ -16,10 +16,9 @@
 
 | 测试 | 数据集 | 命令 | 结果 |
 | --- | --- | --- | --- |
-| 压缩体积 | 10 万点，单列 `f64`（近似正弦），单表 | `python test_final.py` | `.ntt` 体积 5606.90 KB，对比原始约 800 KB（raw/on-disk ~0.14x） |
-| 读性能（第 1 次） | 10 万点，单表 | `python test_read_perf.py` | avg 4.84 ms, p50 4.62 ms, p90 5.82 ms, p99 6.26 ms, 20,674,254 rows/s |
-| 读性能（第 2 次） | 10 万点，单表 | `python test_read_perf.py` | avg 4.65 ms, p50 4.38 ms, p90 5.60 ms, p99 6.64 ms, 21,504,674 rows/s |
-| 读性能（自动区间） | 10 万点，单表，范围由索引推断 | `python test_read_perf.py --auto-range` | avg 4.56 ms, p50 4.60 ms, p90 5.32 ms, p99 6.50 ms, 21,907,203 rows/s |
+| 压缩体积 | 10 万点，单列 `f64`，单表 | `python test_final.py` | `.ntt` 体积 5612.29 KB，对比原始约 800 KB |
+| 压缩比 | 10 万点，单表 | `python test_compression_ratio.py` | raw_total 1562.50 KB, on_disk 19.57 KB, ratio 79.82x |
+| 读性能 | 10 万点，单表 | `python test_read_perf.py` | avg 15.58 ms, p50 14.48 ms, p90 18.91 ms, p99 21.19 ms, 6,420,029 rows/s |
 
 
 ## 你能得到什么
