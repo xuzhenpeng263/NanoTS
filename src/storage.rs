@@ -1104,6 +1104,11 @@ fn rewrite_db_with_table_segments(
                 return Ok(());
             }
         }
+        if hdr.record_type == dbfile::RECORD_WAL
+            || hdr.record_type == dbfile::RECORD_WAL_CHECKPOINT
+        {
+            return Ok(());
+        }
         dbfile::append_record(&tmp, hdr.record_type, payload)?;
         Ok(())
     })?;

@@ -4,7 +4,7 @@ use crate::storage::{Storage, TableStats};
 use crate::wal::{Wal, WalRecord, WalRecordOwned};
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 
@@ -277,6 +277,14 @@ impl NanoTsDb {
         self.storage.table_time_range(table)
     }
 
+    pub fn list_tables(&self) -> io::Result<Vec<String>> {
+        self.storage.list_tables()
+    }
+
+    pub fn last_seq(&self) -> u64 {
+        self.meta.last_seq
+    }
+
     pub fn compact_retention_now(&mut self) -> io::Result<()> {
         let retention_ms = match self.meta.retention_ms {
             Some(ms) => ms,
@@ -467,6 +475,7 @@ impl NanoTsDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dbfile;
     use std::fs;
     use std::time::Duration;
 
@@ -557,6 +566,48 @@ mod tests {
             assert_eq!(ts[1], 1001);
             assert_eq!(cols[0][0], 1.0);
             assert_eq!(cols[0][1], 2.0);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    fn count_records(path: &Path, record_type: u8) -> io::Result<usize> {
+        let mut count = 0usize;
+        dbfile::iter_records(path, |hdr, _| {
+            if hdr.record_type == record_type {
+                count += 1;
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    #[test]
+    fn test_pack_then_wal_replay_after_crash() {
+        let path = fresh_db_path("pack_wal_replay");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table("sensor", &["temp"]).unwrap();
+            for i in 0..1000i64 {
+                db.append_row("sensor", 1000 + i, &[i as f64]).unwrap();
+            }
+            db.flush().unwrap();
+            db.pack_table("sensor", 256).unwrap();
+            let wal_count = count_records(&path, dbfile::RECORD_WAL).unwrap();
+            assert_eq!(wal_count, 0);
+            let chk_count = count_records(&path, dbfile::RECORD_WAL_CHECKPOINT).unwrap();
+            assert_eq!(chk_count, 0);
+
+            db.append_row("sensor", 3000, &[42.0]).unwrap();
+            db.append_row("sensor", 3001, &[43.0]).unwrap();
+            // Drop without flush to force WAL replay.
+        }
+        {
+            let db = NanoTsDb::open(&path, opts).unwrap();
+            let (ts, cols) = db.query_table_range_columns("sensor", 0, 10_000).unwrap();
+            assert_eq!(cols.len(), 1);
+            assert!(ts.contains(&3000));
+            assert!(ts.contains(&3001));
         }
         let _ = fs::remove_file(path);
     }

@@ -22,6 +22,9 @@ fn main() {
                 std::process::exit(2);
             });
         }
+        let before_size = std::fs::metadata(db_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         let mut db = NanoTsDb::open(db_path, NanoTsOptions::default()).unwrap_or_else(|e| {
             eprintln!("打开 DB 失败: {}", e);
             std::process::exit(1);
@@ -30,7 +33,38 @@ fn main() {
             eprintln!("pack 失败: {}", e);
             std::process::exit(1);
         });
-        println!("pack 完成: table={} target={}", table, target);
+        let after_size = std::fs::metadata(db_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        println!(
+            "pack 完成: table={} target={} size={} -> {} bytes",
+            table, target, before_size, after_size
+        );
+    } else if args.len() > 1 && args[1] == "info" {
+        if args.len() < 3 {
+            eprintln!("用法: cargo run --release -- info <db_path>");
+            std::process::exit(2);
+        }
+        let db_path = &args[2];
+        let db = NanoTsDb::open(db_path, NanoTsOptions::default()).unwrap_or_else(|e| {
+            eprintln!("打开 DB 失败: {}", e);
+            std::process::exit(1);
+        });
+        let tables = db.list_tables().unwrap_or_default();
+        println!("path: {}", db_path);
+        println!("last_seq: {}", db.last_seq());
+        match db.retention() {
+            Some(d) => println!("retention_ms: {}", d.as_millis()),
+            None => println!("retention_ms: none"),
+        }
+        if tables.is_empty() {
+            println!("tables: (none)");
+        } else {
+            println!("tables:");
+            for t in tables {
+                println!("  - {}", t);
+            }
+        }
     } else {
         if args.len() > 1 {
             eprintln!("未知命令: {}", args[1]);
@@ -58,11 +92,13 @@ fn main() {
         println!("数据一致性: {}", data == decompressed);
 
         println!("  cargo run --release -- pack <db_path> <table> [--target N]  # 手动 Compaction");
+        println!("  cargo run --release -- info <db_path>                       # 查看 DB 信息");
     }
 }
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!("用法:");
     eprintln!("  cargo run --release -- pack <db_path> <table> [--target N]");
+    eprintln!("  cargo run --release -- info <db_path>");
     std::process::exit(code)
 }
