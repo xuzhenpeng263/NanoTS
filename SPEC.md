@@ -88,7 +88,7 @@ Payload:
 Header:
 
 - `magic`: 4 bytes = `NTSC`
-  - `version`: u8 = `2`
+  - `version`: u8 = `1`
   - `ncols`: u16
 
 Then repeated `ncols` times:
@@ -103,14 +103,14 @@ Then repeated `ncols` times:
 
 Notes:
 
-- v1 schemas (version=1) are **Float64-only** value columns; `ts_ms` is implicit.
+- `ts_ms` is implicit.
 
 ## Table segment payload (multi-column)
 
 Segment header:
 
 - `magic`: 4 bytes = `NTTB`
-- `version`: u8 = `2`
+- `version`: u8 = `1`
 - `min_seq`: u64
 - `max_seq`: u64
 - `count`: u32 (rows in this segment)
@@ -145,9 +145,6 @@ Then repeated `ncols` times:
 - `col_len`: u32 (bytes)
 - `col_bytes`: `col_len` bytes (per codec)
 
-Notes:
-
-- v1 table segments (version=1) have no null bitmap field and only support Float64 columns.
 
 ## Series segment payload (legacy single-column)
 

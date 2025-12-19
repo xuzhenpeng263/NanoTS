@@ -9,7 +9,7 @@
 数据库为单文件（通常为 `*.ntt`），文件头为：
 
 - `magic`：4 bytes = `NTSF`
-- `version`：u8 = `2`
+- `version`：u8 = `1`
 
 文件头之后是连续的**记录（record）**：
 
@@ -103,14 +103,14 @@ Header：
 
 说明：
 
-- v1 schema（version=1）仅支持 **Float64** 取值列；`ts_ms` 为隐含列。
+- `ts_ms` 为隐含列。
 
 ## Table Segment Payload（多列）
 
 Segment header：
 
 - `magic`：4 bytes = `NTTB`
-- `version`：u8 = `2`
+- `version`：u8 = `1`
 - `min_seq`：u64
 - `max_seq`：u64
 - `count`：u32（该段行数）
@@ -145,9 +145,6 @@ Extension header（v1+）：
 - `col_len`：u32（bytes）
 - `col_bytes`：`col_len` bytes（按 codec 编码）
 
-说明：
-
-- v1 table segment（version=1）没有 null bitmap 字段，仅支持 Float64 列。
 
 ## Series Segment Payload（历史单列）
 

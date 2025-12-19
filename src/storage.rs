@@ -16,14 +16,14 @@ const SEG_VERSION: u8 = 1;
 const TS_CODEC_TS64: u8 = 1;
 
 const TABLE_MAGIC: &[u8; 4] = b"NTTB";
-const TABLE_VERSION: u8 = 2;
+const TABLE_VERSION: u8 = 1;
 const TABLE_COL_F64_XOR: u8 = 2;
 const TABLE_COL_I64_D2: u8 = 3;
 const TABLE_COL_BOOL: u8 = 4;
 const TABLE_COL_UTF8: u8 = 5;
 
 const SCHEMA_MAGIC: &[u8; 4] = b"NTSC";
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 1;
 
 const META_MAGIC: &[u8; 4] = b"NTSM";
 const META_VERSION: u8 = 1;
@@ -695,7 +695,7 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
     }
     let ver = read_exact(&mut data, 1)?[0];
-    if ver != 1 && ver != TABLE_VERSION {
+    if ver != TABLE_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
     }
 
@@ -732,15 +732,11 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
 
     let mut cols: Vec<ColumnData> = Vec::with_capacity(ncols);
     for col in &schema.columns {
-        let null_bytes = if ver == 1 {
-            Vec::new()
+        let null_len = u32::from_le_bytes(read_exact(&mut data, 4)?.try_into().unwrap()) as usize;
+        let null_bytes = if null_len > 0 {
+            read_exact(&mut data, null_len)?.to_vec()
         } else {
-            let null_len = u32::from_le_bytes(read_exact(&mut data, 4)?.try_into().unwrap()) as usize;
-            if null_len > 0 {
-                read_exact(&mut data, null_len)?.to_vec()
-            } else {
-                Vec::new()
-            }
+            Vec::new()
         };
 
         let ccodec = read_exact(&mut data, 1)?[0];
@@ -982,7 +978,7 @@ fn decode_table_schema_bytes(data: &[u8]) -> io::Result<TableSchema> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad schema header"));
     }
     let version = data[4];
-    if version != 1 && version != SCHEMA_VERSION {
+    if version != SCHEMA_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad schema header"));
     }
     let mut pos = 5usize;
@@ -1002,17 +998,13 @@ fn decode_table_schema_bytes(data: &[u8]) -> io::Result<TableSchema> {
         pos += len;
         let s = String::from_utf8(b)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad column utf-8"))?;
-        let col_type = if version == 1 {
-            ColumnType::F64
-        } else {
-            if data.len() <= pos {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "short schema"));
-            }
-            let tag = data[pos];
-            pos += 1;
-            ColumnType::from_tag(tag)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad column type"))?
-        };
+        if data.len() <= pos {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short schema"));
+        }
+        let tag = data[pos];
+        pos += 1;
+        let col_type = ColumnType::from_tag(tag)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad column type"))?;
         columns.push(ColumnSchema {
             name: s,
             col_type,
@@ -1198,7 +1190,7 @@ fn table_segment_storage_stats(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
     }
     let ver = read_exact(1)?[0];
-    if ver != 1 && ver != TABLE_VERSION {
+    if ver != TABLE_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
     }
 
@@ -1233,34 +1225,22 @@ fn table_segment_storage_stats(
 
     let mut stored_value_bytes = 0u64;
     for _ in 0..ncols {
-        if ver == 1 {
-            let ccodec = read_exact(1)?[0];
-            header_bytes += 1;
-            if ccodec != TABLE_COL_F64_XOR && ccodec != TABLE_COL_I64_D2 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
-            }
-            let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
-            header_bytes += 4;
-            stored_value_bytes += clen;
-            let _ = read_exact(clen as usize)?;
-        } else {
-            let null_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
-            header_bytes += 4 + null_len;
-            let _ = read_exact(null_len as usize)?;
-            let ccodec = read_exact(1)?[0];
-            header_bytes += 1;
-            if ccodec != TABLE_COL_F64_XOR
-                && ccodec != TABLE_COL_I64_D2
-                && ccodec != TABLE_COL_BOOL
-                && ccodec != TABLE_COL_UTF8
-            {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
-            }
-            let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
-            header_bytes += 4;
-            stored_value_bytes += clen;
-            let _ = read_exact(clen as usize)?;
+        let null_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
+        header_bytes += 4 + null_len;
+        let _ = read_exact(null_len as usize)?;
+        let ccodec = read_exact(1)?[0];
+        header_bytes += 1;
+        if ccodec != TABLE_COL_F64_XOR
+            && ccodec != TABLE_COL_I64_D2
+            && ccodec != TABLE_COL_BOOL
+            && ccodec != TABLE_COL_UTF8
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
         }
+        let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as u64;
+        header_bytes += 4;
+        stored_value_bytes += clen;
+        let _ = read_exact(clen as usize)?;
     }
 
     Ok((count, ts_len, stored_value_bytes, header_bytes))
@@ -1282,7 +1262,7 @@ fn parse_table_segment_header(data: &[u8]) -> io::Result<TableSegmentHeader> {
     if &data[0..4] != TABLE_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
     }
-    if data[4] != 1 && data[4] != TABLE_VERSION {
+    if data[4] != TABLE_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
     }
     let min_seq = u64::from_le_bytes(data[5..13].try_into().unwrap());

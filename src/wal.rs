@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const WAL_MAGIC: &[u8; 4] = b"NTWL";
-const WAL_VERSION: u8 = 2;
+const WAL_VERSION: u8 = 1;
 const RECORD_APPEND: u8 = 1;
 const RECORD_APPEND_ROW: u8 = 2;
 const RECORD_APPEND_ROW_TYPED: u8 = 3;
@@ -235,17 +235,10 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
     if payload.len() < 6 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short WAL payload"));
     }
-    if &payload[0..4] != WAL_MAGIC {
+    if &payload[0..4] != WAL_MAGIC || payload[4] != WAL_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid WAL record header",
-        ));
-    }
-    let version = payload[4];
-    if version != 1 && version != WAL_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported WAL version",
         ));
     }
     let mut pos = 5usize;
@@ -314,12 +307,6 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             })
         }
         RECORD_APPEND_ROW_TYPED => {
-            if version == 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "typed WAL record not supported in v1",
-                ));
-            }
             let seq = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let table_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
