@@ -1,6 +1,16 @@
 target/
 **/*.ntt
 **/*.lock
+.DS_Store
+*.hdr
+*.log
+*.out
+*~
+.idea
+.vscode
+__pycache__/
+bin/
+openb_pod_list*/
 python/nanots-py/target/
 python/nanots-py/__pycache__/
 python/nanots-py/*.egg-info/
