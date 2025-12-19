@@ -2,9 +2,9 @@
 //
 // DataFusion integration (read-only SQL).
 
-use crate::db::{ColumnType, NanoTsDb};
+use crate::db::{ColumnData, ColumnType, NanoTsDb};
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{TableProvider, TableType};
@@ -112,7 +112,7 @@ impl NanoTsTable {
     fn build_batches(
         schema: SchemaRef,
         ts: Vec<i64>,
-        cols: Vec<Vec<f64>>,
+        cols: Vec<ColumnData>,
         limit: Option<usize>,
     ) -> DFResult<Vec<RecordBatch>> {
         let total_rows = ts.len();
@@ -128,9 +128,21 @@ impl NanoTsTable {
             arrays.push(Arc::new(Int64Array::from(ts_chunk.clone())));
             arrays.push(Arc::new(Int64Array::from(ts_chunk)));
             for col in &cols {
-                arrays.push(Arc::new(Float64Array::from(
-                    col[offset..offset + take].to_vec(),
-                )));
+                let array = match col {
+                    ColumnData::F64(values) => Arc::new(Float64Array::from(
+                        values[offset..offset + take].to_vec(),
+                    )) as ArrayRef,
+                    ColumnData::I64(values) => Arc::new(Int64Array::from(
+                        values[offset..offset + take].to_vec(),
+                    )) as ArrayRef,
+                    ColumnData::Bool(values) => Arc::new(BooleanArray::from(
+                        values[offset..offset + take].to_vec(),
+                    )) as ArrayRef,
+                    ColumnData::Utf8(values) => Arc::new(StringArray::from(
+                        values[offset..offset + take].to_vec(),
+                    )) as ArrayRef,
+                };
+                arrays.push(array);
             }
             let batch = RecordBatch::try_new(schema.clone(), arrays)
                 .map_err(|e| DataFusionError::Execution(format!("record batch build failed: {e}")))?;
@@ -171,7 +183,7 @@ impl TableProvider for NanoTsTable {
         let limit_copy = limit;
         let batches = task::spawn_blocking(move || {
             let (ts, cols) = db
-                .query_table_range_columns(&table, start, end)
+                .query_table_range_typed(&table, start, end)
                 .map_err(|e| DataFusionError::Execution(format!("query failed: {e}")))?;
             NanoTsTable::build_batches(schema, ts, cols, limit_copy)
         })
@@ -221,12 +233,13 @@ fn build_table_schema(db: &NanoTsDb, table: &str) -> DFResult<SchemaRef> {
     fields.push(Field::new("ts", DataType::Int64, false));
     fields.push(Field::new("ts_ms", DataType::Int64, false));
     for col in schema.columns {
-        if col.col_type != ColumnType::F64 {
-            return Err(DataFusionError::Execution(
-                "only Float64 columns are supported in DataFusion for now".to_string(),
-            ));
-        }
-        fields.push(Field::new(&col.name, DataType::Float64, true));
+        let dtype = match col.col_type {
+            ColumnType::F64 => DataType::Float64,
+            ColumnType::I64 => DataType::Int64,
+            ColumnType::Bool => DataType::Boolean,
+            ColumnType::Utf8 => DataType::Utf8,
+        };
+        fields.push(Field::new(&col.name, dtype, true));
     }
     Ok(Arc::new(Schema::new(fields)))
 }

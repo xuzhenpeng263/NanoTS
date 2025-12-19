@@ -232,6 +232,82 @@ fn parse_sql_values(values: &str) -> io::Result<Vec<Value>> {
     Ok(out)
 }
 
+fn parse_sql_value_rows(values: &str) -> io::Result<Vec<Vec<Value>>> {
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = values.chars().peekable();
+    let mut in_string = false;
+    let mut depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    buf.push('\'');
+                    chars.next();
+                } else {
+                    in_string = false;
+                }
+            } else {
+                buf.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_string = true,
+            '(' => {
+                if depth == 0 {
+                    buf.clear();
+                } else {
+                    buf.push(ch);
+                }
+                depth += 1;
+            }
+            ')' => {
+                if depth == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unmatched closing paren",
+                    ));
+                }
+                depth -= 1;
+                if depth == 0 {
+                    rows.push(parse_sql_values(&buf)?);
+                    buf.clear();
+                } else {
+                    buf.push(ch);
+                }
+            }
+            ',' => {
+                if depth > 0 {
+                    buf.push(ch);
+                }
+            }
+            _ => {
+                if depth > 0 {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    if in_string {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unterminated string"));
+    }
+    if depth != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unterminated values list",
+        ));
+    }
+    if rows.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing VALUES rows",
+        ));
+    }
+    Ok(rows)
+}
+
 fn parse_sql_value_token(token: &str) -> io::Result<Value> {
     let t = token.trim();
     if t.is_empty() {
@@ -750,49 +826,96 @@ impl NanoTsDb {
             .find("values")
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing VALUES"))?;
         let table_part = sql["insert into".len()..values_idx].trim();
-        if table_part.contains('(') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "column list in INSERT not supported",
-            ));
-        }
-        let table = parse_sql_ident(table_part)?;
-        let values_part = &sql[values_idx + "values".len()..];
-        let open = values_part.find('(').ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing VALUES list")
-        })?;
-        let close = values_part.rfind(')').ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing closing paren")
-        })?;
-        if close <= open {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bad VALUES list",
-            ));
-        }
-        let values_raw = &values_part[open + 1..close];
-        let mut values = parse_sql_values(values_raw)?;
-
-        let schema = self.storage.read_table_schema(&table)?;
-        if values.len() != schema.columns.len() + 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "values length mismatch"));
-        }
-        let ts_value = values.remove(0);
-        let ts_ms = match ts_value {
-            Value::I64(v) => v,
-            Value::F64(v) if v.is_finite() && v.fract() == 0.0 => v as i64,
-            _ => {
+        let (table, column_list) = if let Some(open) = table_part.find('(') {
+            let close = table_part.rfind(')').ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing closing paren")
+            })?;
+            if close <= open {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "invalid ts_ms value",
-                ))
+                    "bad column list",
+                ));
             }
+            let table = parse_sql_ident(table_part[..open].trim())?;
+            let cols_raw = &table_part[open + 1..close];
+            let cols = cols_raw
+                .split(',')
+                .map(|c| parse_sql_ident(c))
+                .collect::<io::Result<Vec<String>>>()?;
+            (table, Some(cols))
+        } else {
+            (parse_sql_ident(table_part)?, None)
         };
-        for (value, col) in values.iter_mut().zip(schema.columns.iter()) {
-            let coerced = coerce_value_for_type(value.clone(), col.col_type)?;
-            *value = coerced;
+
+        let values_part = &sql[values_idx + "values".len()..];
+        let rows = parse_sql_value_rows(values_part)?;
+        let schema = self.storage.read_table_schema(&table)?;
+
+        for row in rows {
+            if let Some(cols) = &column_list {
+                if row.len() != cols.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "values length mismatch",
+                    ));
+                }
+                let mut values = vec![Value::Null; schema.columns.len()];
+                let mut ts_ms: Option<i64> = None;
+                for (name, value) in cols.iter().zip(row.into_iter()) {
+                    if name == "ts_ms" || name == "ts" {
+                        let ts = match value {
+                            Value::I64(v) => v,
+                            Value::F64(v) if v.is_finite() && v.fract() == 0.0 => v as i64,
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "invalid ts_ms value",
+                                ))
+                            }
+                        };
+                        ts_ms = Some(ts);
+                        continue;
+                    }
+                    let idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "unknown column")
+                        })?;
+                    let coerced = coerce_value_for_type(value, schema.columns[idx].col_type)?;
+                    values[idx] = coerced;
+                }
+                let ts_ms = ts_ms.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing ts_ms")
+                })?;
+                self.append_row_typed(&table, ts_ms, &values)?;
+            } else {
+                if row.len() != schema.columns.len() + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "values length mismatch",
+                    ));
+                }
+                let mut values = row;
+                let ts_value = values.remove(0);
+                let ts_ms = match ts_value {
+                    Value::I64(v) => v,
+                    Value::F64(v) if v.is_finite() && v.fract() == 0.0 => v as i64,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid ts_ms value",
+                        ))
+                    }
+                };
+                for (value, col) in values.iter_mut().zip(schema.columns.iter()) {
+                    let coerced = coerce_value_for_type(value.clone(), col.col_type)?;
+                    *value = coerced;
+                }
+                self.append_row_typed(&table, ts_ms, &values)?;
+            }
         }
-        self.append_row_typed(&table, ts_ms, &values)?;
         Ok(())
     }
 
@@ -1331,16 +1454,22 @@ mod tests {
                 .unwrap();
             db.execute_sql("INSERT INTO t VALUES (1001, null, false, 'y', 2)")
                 .unwrap();
+            db.execute_sql(
+                "INSERT INTO t (ts_ms, c, d) VALUES (1002, 'z', 3.5), (1003, 'w', 4.5)",
+            )
+                .unwrap();
             db.flush().unwrap();
         }
         {
             let db = NanoTsDb::open(&path, opts).unwrap();
             let (ts, cols) = db.query_table_range_typed("t", 0, 10_000).unwrap();
-            assert_eq!(ts.len(), 2);
+            assert_eq!(ts.len(), 4);
             match &cols[0] {
                 ColumnData::I64(values) => {
                     assert_eq!(values[0], Some(1));
                     assert_eq!(values[1], None);
+                    assert_eq!(values[2], None);
+                    assert_eq!(values[3], None);
                 }
                 _ => panic!("unexpected column type"),
             }
@@ -1348,6 +1477,8 @@ mod tests {
                 ColumnData::Bool(values) => {
                     assert_eq!(values[0], Some(true));
                     assert_eq!(values[1], Some(false));
+                    assert_eq!(values[2], None);
+                    assert_eq!(values[3], None);
                 }
                 _ => panic!("unexpected column type"),
             }
@@ -1355,6 +1486,8 @@ mod tests {
                 ColumnData::Utf8(values) => {
                     assert_eq!(values[0].as_deref(), Some("x"));
                     assert_eq!(values[1].as_deref(), Some("y"));
+                    assert_eq!(values[2].as_deref(), Some("z"));
+                    assert_eq!(values[3].as_deref(), Some("w"));
                 }
                 _ => panic!("unexpected column type"),
             }
@@ -1362,6 +1495,8 @@ mod tests {
                 ColumnData::F64(values) => {
                     assert_eq!(values[0], Some(1.5));
                     assert_eq!(values[1], Some(2.0));
+                    assert_eq!(values[2], Some(3.5));
+                    assert_eq!(values[3], Some(4.5));
                 }
                 _ => panic!("unexpected column type"),
             }
