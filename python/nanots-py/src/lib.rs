@@ -5,7 +5,7 @@ use nanots_core::db::{ColumnData, ColumnType, Value};
 use nanots_core::{NanoTsDb, NanoTsOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyString};
+use pyo3::types::{PyAny, PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyString};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -64,7 +64,7 @@ impl Db {
     fn append_row_typed(&self, py: Python<'_>, table: &str, ts_ms: i64, values: Vec<PyObject>) -> PyResult<u64> {
         let mut out: Vec<Value> = Vec::with_capacity(values.len());
         for v in values {
-            let value = py_to_value(v.as_ref(py))?;
+            let value = py_to_value(&v.bind(py))?;
             out.push(value);
         }
         let mut db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
@@ -359,20 +359,20 @@ fn parse_column_type(ty: &str) -> PyResult<ColumnType> {
     }
 }
 
-fn py_to_value(obj: &PyAny) -> PyResult<Value> {
+fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
     }
-    if obj.is_instance_of::<PyBool>()? {
+    if obj.is_instance_of::<PyBool>() {
         return Ok(Value::Bool(obj.extract::<bool>()?));
     }
-    if obj.is_instance_of::<PyInt>()? {
+    if obj.is_instance_of::<PyInt>() {
         return Ok(Value::I64(obj.extract::<i64>()?));
     }
-    if obj.is_instance_of::<PyFloat>()? {
+    if obj.is_instance_of::<PyFloat>() {
         return Ok(Value::F64(obj.extract::<f64>()?));
     }
-    if obj.is_instance_of::<PyString>()? {
+    if obj.is_instance_of::<PyString>() {
         return Ok(Value::Utf8(obj.extract::<String>()?));
     }
     Err(PyRuntimeError::new_err(format!(

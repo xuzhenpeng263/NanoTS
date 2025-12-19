@@ -4,7 +4,7 @@
 
 use crate::db::{ColumnData, ColumnType, NanoTsDb};
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{TableProvider, TableType};
