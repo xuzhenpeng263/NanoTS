@@ -1,20 +1,6 @@
-/target
-/go_gorilla_bench/.gocache/
-/go_gorilla_bench/.gomodcache/
-/data
-/clusterdata/
-/logs/
-/bench_db*/
-/my_db*/
-*.ts64bin
-go_gorilla_bench/bench_data
-
-# Python bindings (maturin / local tests)
-/python/nanots-py/target/
-/python/nanots-py/dist/
-/python/nanots-py/__pycache__/
-/python/nanots-py/*.egg-info/
-/python/nanots-py/.pytest_cache/
-/python/nanots-py/.venv/
-/python/nanots-py/bench_db*/
-/python/nanots-py/.maturin/
+target/
+**/*.ntt
+**/*.lock
+python/nanots-py/target/
+python/nanots-py/__pycache__/
+python/nanots-py/*.egg-info/
