@@ -163,6 +163,117 @@ fn to_wal_value(value: &Value) -> WalValue<'_> {
     }
 }
 
+fn parse_sql_column_type(ty: &str) -> Option<ColumnType> {
+    match ty.trim().to_ascii_lowercase().as_str() {
+        "f64" | "float" | "double" | "real" => Some(ColumnType::F64),
+        "i64" | "int" | "integer" | "bigint" => Some(ColumnType::I64),
+        "bool" | "boolean" => Some(ColumnType::Bool),
+        "text" | "string" | "utf8" => Some(ColumnType::Utf8),
+        _ => None,
+    }
+}
+
+fn coerce_value_for_type(value: Value, col_type: ColumnType) -> io::Result<Value> {
+    match (value, col_type) {
+        (Value::Null, _) => Ok(Value::Null),
+        (Value::F64(v), ColumnType::F64) => Ok(Value::F64(v)),
+        (Value::I64(v), ColumnType::I64) => Ok(Value::I64(v)),
+        (Value::Bool(v), ColumnType::Bool) => Ok(Value::Bool(v)),
+        (Value::Utf8(v), ColumnType::Utf8) => Ok(Value::Utf8(v)),
+        (Value::I64(v), ColumnType::F64) => Ok(Value::F64(v as f64)),
+        (Value::F64(v), ColumnType::I64) => {
+            if v.is_finite() && v.fract() == 0.0 {
+                Ok(Value::I64(v as i64))
+            } else {
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "type mismatch"))
+            }
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "type mismatch")),
+    }
+}
+
+fn parse_sql_values(values: &str) -> io::Result<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut chars = values.chars().peekable();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    buf.push('\'');
+                    chars.next();
+                } else {
+                    in_string = false;
+                }
+            } else {
+                buf.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' => {
+                in_string = true;
+            }
+            ',' => {
+                out.push(parse_sql_value_token(&buf)?);
+                buf.clear();
+            }
+            _ => {
+                buf.push(ch);
+            }
+        }
+    }
+    if in_string {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unterminated string"));
+    }
+    if !buf.trim().is_empty() || values.trim().ends_with(',') {
+        out.push(parse_sql_value_token(&buf)?);
+    }
+    Ok(out)
+}
+
+fn parse_sql_value_token(token: &str) -> io::Result<Value> {
+    let t = token.trim();
+    if t.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty value"));
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower == "null" {
+        return Ok(Value::Null);
+    }
+    if lower == "true" {
+        return Ok(Value::Bool(true));
+    }
+    if lower == "false" {
+        return Ok(Value::Bool(false));
+    }
+    if let Ok(v) = t.parse::<i64>() {
+        return Ok(Value::I64(v));
+    }
+    if let Ok(v) = t.parse::<f64>() {
+        return Ok(Value::F64(v));
+    }
+    Ok(Value::Utf8(t.to_string()))
+}
+
+fn parse_sql_ident(ident: &str) -> io::Result<String> {
+    let ident = ident.trim();
+    if ident.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty identifier"));
+    }
+    if !ident
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid identifier",
+        ));
+    }
+    Ok(ident.to_string())
+}
+
 #[derive(Debug)]
 struct PendingRow {
     seq: u64,
@@ -564,6 +675,94 @@ impl NanoTsDb {
         Ok((ts_sorted, cols_sorted))
     }
 
+    fn execute_create_table(&mut self, sql: &str) -> io::Result<()> {
+        let lower = sql.to_ascii_lowercase();
+        let mut rest = &sql["create table".len()..];
+        if lower["create table".len()..].trim_start().starts_with("if not exists") {
+            let idx = lower.find("if not exists").unwrap();
+            rest = &sql[idx + "if not exists".len()..];
+        }
+        rest = rest.trim_start();
+        let open = rest.find('(').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing column list")
+        })?;
+        let close = rest.rfind(')').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing closing paren")
+        })?;
+        if close <= open {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad column list"));
+        }
+        let name = parse_sql_ident(rest[..open].trim())?;
+        let cols_str = &rest[open + 1..close];
+        let mut cols: Vec<(&str, ColumnType)> = Vec::new();
+        for col_def in cols_str.split(',') {
+            let mut parts = col_def.split_whitespace();
+            let col_name = parts
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad column"))?;
+            let col_type = parts
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad column type"))?;
+            let col_type = parse_sql_column_type(col_type).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unsupported column type")
+            })?;
+            cols.push((col_name, col_type));
+        }
+        self.create_table_typed(&name, &cols)
+    }
+
+    fn execute_insert(&mut self, sql: &str) -> io::Result<()> {
+        let lower = sql.to_ascii_lowercase();
+        let values_idx = lower
+            .find("values")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing VALUES"))?;
+        let table_part = sql["insert into".len()..values_idx].trim();
+        if table_part.contains('(') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "column list in INSERT not supported",
+            ));
+        }
+        let table = parse_sql_ident(table_part)?;
+        let values_part = &sql[values_idx + "values".len()..];
+        let open = values_part.find('(').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing VALUES list")
+        })?;
+        let close = values_part.rfind(')').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing closing paren")
+        })?;
+        if close <= open {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bad VALUES list",
+            ));
+        }
+        let values_raw = &values_part[open + 1..close];
+        let mut values = parse_sql_values(values_raw)?;
+
+        let schema = self.storage.read_table_schema(&table)?;
+        if values.len() != schema.columns.len() + 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "values length mismatch"));
+        }
+        let ts_value = values.remove(0);
+        let ts_ms = match ts_value {
+            Value::I64(v) => v,
+            Value::F64(v) if v.is_finite() && v.fract() == 0.0 => v as i64,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid ts_ms value",
+                ))
+            }
+        };
+        for (value, col) in values.iter_mut().zip(schema.columns.iter()) {
+            let coerced = coerce_value_for_type(value.clone(), col.col_type)?;
+            *value = coerced;
+        }
+        self.append_row_typed(&table, ts_ms, &values)?;
+        Ok(())
+    }
+
     pub fn table_schema(&self, table: &str) -> io::Result<TableSchema> {
         self.storage.read_table_schema(table)
     }
@@ -582,6 +781,24 @@ impl NanoTsDb {
 
     pub fn last_seq(&self) -> u64 {
         self.meta.last_seq
+    }
+
+    pub fn execute_sql(&mut self, sql: &str) -> io::Result<()> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return Ok(());
+        }
+        let lower = sql.to_ascii_lowercase();
+        if lower.starts_with("create table") {
+            return self.execute_create_table(sql);
+        }
+        if lower.starts_with("insert into") {
+            return self.execute_insert(sql);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported SQL statement",
+        ))
     }
 
     #[cfg(feature = "datafusion")]
@@ -1062,6 +1279,56 @@ mod tests {
                 ColumnData::F64(values) => {
                     assert_eq!(values[0], Some(1.25));
                     assert_eq!(values[1], Some(2.5));
+                }
+                _ => panic!("unexpected column type"),
+            }
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_execute_sql_create_insert() {
+        let path = fresh_db_path("sql_exec");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.execute_sql("CREATE TABLE t (a i64, b bool, c utf8, d f64)")
+                .unwrap();
+            db.execute_sql("INSERT INTO t VALUES (1000, 1, true, 'x', 1.5)")
+                .unwrap();
+            db.execute_sql("INSERT INTO t VALUES (1001, null, false, 'y', 2)")
+                .unwrap();
+            db.flush().unwrap();
+        }
+        {
+            let db = NanoTsDb::open(&path, opts).unwrap();
+            let (ts, cols) = db.query_table_range_typed("t", 0, 10_000).unwrap();
+            assert_eq!(ts.len(), 2);
+            match &cols[0] {
+                ColumnData::I64(values) => {
+                    assert_eq!(values[0], Some(1));
+                    assert_eq!(values[1], None);
+                }
+                _ => panic!("unexpected column type"),
+            }
+            match &cols[1] {
+                ColumnData::Bool(values) => {
+                    assert_eq!(values[0], Some(true));
+                    assert_eq!(values[1], Some(false));
+                }
+                _ => panic!("unexpected column type"),
+            }
+            match &cols[2] {
+                ColumnData::Utf8(values) => {
+                    assert_eq!(values[0].as_deref(), Some("x"));
+                    assert_eq!(values[1].as_deref(), Some("y"));
+                }
+                _ => panic!("unexpected column type"),
+            }
+            match &cols[3] {
+                ColumnData::F64(values) => {
+                    assert_eq!(values[0], Some(1.5));
+                    assert_eq!(values[1], Some(2.0));
                 }
                 _ => panic!("unexpected column type"),
             }

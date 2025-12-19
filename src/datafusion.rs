@@ -13,6 +13,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
 use datafusion::scalar::ScalarValue;
 use std::any::Any;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub fn query_sql(db: Arc<NanoTsDb>, sql: &str) -> DFResult<Vec<RecordBatch>> {
 
     rt.block_on(async move {
         let ctx = SessionContext::new();
+        register_time_bucket(&ctx)?;
         register_all_tables(db, &ctx)?;
         let df = ctx.sql(sql).await?;
         df.collect().await
@@ -40,6 +42,53 @@ fn register_all_tables(db: Arc<NanoTsDb>, ctx: &SessionContext) -> DFResult<()> 
         let provider = NanoTsTable::try_new(db.clone(), &table)?;
         ctx.register_table(&table, Arc::new(provider))?;
     }
+    Ok(())
+}
+
+fn register_time_bucket(ctx: &SessionContext) -> DFResult<()> {
+    let fun: ScalarFunctionImplementation = Arc::new(|args: &[ColumnarValue]| {
+        if args.len() != 2 {
+            return Err(DataFusionError::Execution(
+                "time_bucket expects 2 arguments".to_string(),
+            ));
+        }
+        let arrays = ColumnarValue::values_to_arrays(args)
+            .map_err(|e| DataFusionError::Execution(format!("time_bucket args: {e}")))?;
+        let interval = arrays[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataFusionError::Execution("time_bucket interval must be Int64".to_string()))?;
+        let ts = arrays[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataFusionError::Execution("time_bucket ts must be Int64".to_string()))?;
+        let mut out: Vec<Option<i64>> = Vec::with_capacity(ts.len());
+        for i in 0..ts.len() {
+            if interval.is_null(i) || ts.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let step = interval.value(i);
+            if step <= 0 {
+                return Err(DataFusionError::Execution(
+                    "time_bucket interval must be positive".to_string(),
+                ));
+            }
+            let v = ts.value(i);
+            let bucket = v.div_euclid(step).saturating_mul(step);
+            out.push(Some(bucket));
+        }
+        Ok(ColumnarValue::Array(Arc::new(Int64Array::from(out)) as ArrayRef))
+    });
+
+    let udf = create_udf(
+        "time_bucket",
+        vec![DataType::Int64, DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        fun,
+    );
+    ctx.register_udf(udf);
     Ok(())
 }
 
