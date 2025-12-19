@@ -535,4 +535,29 @@ mod tests {
         }
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn test_wal_replay_after_crash() {
+        let path = fresh_db_path("wal_replay");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table("sensor", &["temp"]).unwrap();
+            db.append_row("sensor", 1000, &[1.0]).unwrap();
+            db.append_row("sensor", 1001, &[2.0]).unwrap();
+            // Drop without flush to force WAL replay on reopen.
+        }
+        {
+            let db = NanoTsDb::open(&path, opts).unwrap();
+            let (ts, cols) = db.query_table_range_columns("sensor", 0, 10_000).unwrap();
+            assert_eq!(cols.len(), 1);
+            assert_eq!(ts.len(), 2);
+            assert_eq!(cols[0].len(), 2);
+            assert_eq!(ts[0], 1000);
+            assert_eq!(ts[1], 1001);
+            assert_eq!(cols[0][0], 1.0);
+            assert_eq!(cols[0][1], 2.0);
+        }
+        let _ = fs::remove_file(path);
+    }
 }
