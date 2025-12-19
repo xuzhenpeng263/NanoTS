@@ -18,5 +18,5 @@ classifiers = [
 [tool.maturin]
 bindings = "pyo3"
 module-name = "nanots"
-features = ["arrow"]
+features = ["arrow", "datafusion"]
 include = ["nanots.pyi", "py.typed"]

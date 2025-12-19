@@ -11,8 +11,11 @@ crate-type = ["cdylib"]
 [dependencies]
 nanots-core = { package = "nanots", path = "../..", default-features = false }
 pyo3 = { version = "0.23", features = ["extension-module"] }
+datafusion = { version = "43", optional = true }
+arrow = { version = "53.4.1", features = ["ffi"], optional = true }
 
 [features]
-default = ["arrow"]
+default = ["arrow", "datafusion"]
 # Enable Arrow C Data Interface export (and the Python capsule APIs built on top of it).
 arrow = ["nanots-core/arrow"]
+datafusion = ["nanots-core/datafusion", "dep:datafusion", "dep:arrow"]

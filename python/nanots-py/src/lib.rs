@@ -11,6 +11,7 @@ use std::time::Duration;
 #[pyclass]
 struct Db {
     inner: Mutex<NanoTsDb>,
+    path: String,
 }
 
 #[pymethods]
@@ -25,6 +26,7 @@ impl Db {
         let db = NanoTsDb::open(path, opts).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             inner: Mutex::new(db),
+            path: path.to_string(),
         })
     }
 
@@ -158,6 +160,51 @@ impl Db {
 
         // Follow PyArrow's `_import_from_c_capsule(schema_capsule, array_capsule)` convention.
         Ok((schema_capsule, array_capsule))
+    }
+
+    /// Returns an Arrow C Stream capsule for SQL query results.
+    /// Import in Python with `pyarrow.RecordBatchReader._import_from_c_capsule(capsule)`.
+    #[cfg(feature = "datafusion")]
+    fn query_sql_arrow_stream_capsule(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        use arrow::ffi_stream::FFI_ArrowArrayStream;
+        use datafusion::arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
+        use std::sync::Arc;
+
+        let db = Arc::new(
+            NanoTsDb::open(&self.path, NanoTsOptions::default())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        );
+        let batches = nanots_core::datafusion::query_sql(db, sql)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let schema = batches
+            .get(0)
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+        let stream = Box::new(FFI_ArrowArrayStream::new(reader));
+
+        unsafe extern "C" fn capsule_destructor_stream(capsule: *mut pyo3::ffi::PyObject) {
+            let ptr =
+                pyo3::ffi::PyCapsule_GetPointer(capsule, b"arrow_array_stream\0".as_ptr() as *const _);
+            if !ptr.is_null() {
+                drop(Box::from_raw(ptr as *mut FFI_ArrowArrayStream));
+            }
+        }
+
+        let stream_ptr = Box::into_raw(stream) as *mut std::ffi::c_void;
+        let stream_capsule = unsafe {
+            PyObject::from_owned_ptr(
+                py,
+                pyo3::ffi::PyCapsule_New(
+                    stream_ptr,
+                    b"arrow_array_stream\0".as_ptr() as *const _,
+                    Some(capsule_destructor_stream),
+                ),
+            )
+        };
+        Ok(stream_capsule)
     }
 
     fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
