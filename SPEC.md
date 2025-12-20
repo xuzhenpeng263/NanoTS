@@ -140,10 +140,11 @@ Then repeated `ncols` times:
 - `col_codec`: u8
   - `2` = `TABLE_COL_F64_XOR` (Gorilla XOR-style)
   - `3` = `TABLE_COL_I64_D2` (compressed `i64`)
-  - `4` = `TABLE_COL_BOOL` (bit-packed bools)
+  - `4` = `TABLE_COL_BOOL` (bit-packed bools, LSB-first)
   - `5` = `TABLE_COL_UTF8` (offsets + data)
 - `col_len`: u32 (bytes)
 - `col_bytes`: `col_len` bytes (per codec)
+  - `TABLE_COL_BOOL`: `ceil(count / 8)` bytes, bit `i` is value `i` (LSB-first)
 
 
 ## Series segment payload (legacy single-column)

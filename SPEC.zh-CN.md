@@ -140,10 +140,11 @@ Extension header（v1+）：
 - `col_codec`：u8
   - `2` = `TABLE_COL_F64_XOR`（Gorilla XOR 风格）
   - `3` = `TABLE_COL_I64_D2`（`i64` 压缩存储）
-  - `4` = `TABLE_COL_BOOL`（bool 位图）
+  - `4` = `TABLE_COL_BOOL`（bool 位图，低位在前）
   - `5` = `TABLE_COL_UTF8`（offsets + data）
 - `col_len`：u32（bytes）
 - `col_bytes`：`col_len` bytes（按 codec 编码）
+  - `TABLE_COL_BOOL`：`ceil(count / 8)` 字节，bit `i` 表示第 `i` 个值（低位在前）
 
 
 ## Series Segment Payload（历史单列）

@@ -823,13 +823,17 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
                 if ccodec != TABLE_COL_BOOL {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
                 }
-                if blob.len() != count {
+                let expected = (count + 7) / 8;
+                if blob.len() != expected {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "col count mismatch"));
                 }
                 let mut out: Vec<Option<bool>> = Vec::with_capacity(count);
                 for i in 0..count {
                     if null_bytes.is_empty() || is_valid(&null_bytes, i) {
-                        out.push(Some(blob[i] != 0));
+                        let byte = i / 8;
+                        let bit = i % 8;
+                        let value = ((blob[byte] >> bit) & 1) == 1;
+                        out.push(Some(value));
                     } else {
                         out.push(None);
                     }
@@ -1019,6 +1023,13 @@ fn build_null_bitmap<T>(values: &[Option<T>]) -> Option<Vec<u8>> {
     }
 }
 
+fn checked_u32_len(len: usize, what: &str) -> io::Result<u32> {
+    if len > u32::MAX as usize {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, what));
+    }
+    Ok(len as u32)
+}
+
 fn is_valid(bitmap: &[u8], idx: usize) -> bool {
     let byte = idx / 8;
     let bit = idx % 8;
@@ -1149,7 +1160,7 @@ fn encode_table_segment(
         }
     }
 
-    let count = ts_ms.len() as u32;
+    let count = checked_u32_len(ts_ms.len(), "row count exceeds u32::MAX")?;
     let mut min_ts = ts_ms[0];
     let mut max_ts = ts_ms[0];
     for &t in ts_ms {
@@ -1157,6 +1168,7 @@ fn encode_table_segment(
         max_ts = max_ts.max(t);
     }
     let ts_bytes = TimeSeriesCompressor::compress(ts_ms);
+    let ts_len = checked_u32_len(ts_bytes.len(), "ts bytes exceed u32::MAX")?;
 
     let mut out = Vec::new();
     out.extend_from_slice(TABLE_MAGIC);
@@ -1168,7 +1180,7 @@ fn encode_table_segment(
     out.extend_from_slice(&max_ts.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.push(TS_CODEC_TS64);
-    out.extend_from_slice(&(ts_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ts_len.to_le_bytes());
     out.extend_from_slice(&ts_bytes);
     out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
     for (col, schema_col) in cols.iter().zip(schema.columns.iter()) {
@@ -1177,13 +1189,15 @@ fn encode_table_segment(
                 let nulls = build_null_bitmap(values);
                 let (codec, blob) = compress_f64_column_auto(values);
                 if let Some(nulls) = nulls {
-                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
+                    out.extend_from_slice(&null_len.to_le_bytes());
                     out.extend_from_slice(&nulls);
                 } else {
                     out.extend_from_slice(&0u32.to_le_bytes());
                 }
                 out.push(codec);
-                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                let blob_len = checked_u32_len(blob.len(), "column bytes exceed u32::MAX")?;
+                out.extend_from_slice(&blob_len.to_le_bytes());
                 out.extend_from_slice(&blob);
             }
             (ColumnData::I64(values), ColumnType::I64) => {
@@ -1194,29 +1208,37 @@ fn encode_table_segment(
                 }
                 let blob = TimeSeriesCompressor::compress(&raw);
                 if let Some(nulls) = nulls {
-                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
+                    out.extend_from_slice(&null_len.to_le_bytes());
                     out.extend_from_slice(&nulls);
                 } else {
                     out.extend_from_slice(&0u32.to_le_bytes());
                 }
                 out.push(TABLE_COL_I64_D2);
-                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                let blob_len = checked_u32_len(blob.len(), "column bytes exceed u32::MAX")?;
+                out.extend_from_slice(&blob_len.to_le_bytes());
                 out.extend_from_slice(&blob);
             }
             (ColumnData::Bool(values), ColumnType::Bool) => {
                 let nulls = build_null_bitmap(values);
-                let mut raw: Vec<u8> = Vec::with_capacity(values.len());
-                for v in values {
-                    raw.push(u8::from(v.unwrap_or(false)));
+                let mut raw = vec![0u8; (values.len() + 7) / 8];
+                for (i, v) in values.iter().enumerate() {
+                    if v.unwrap_or(false) {
+                        let byte = i / 8;
+                        let bit = i % 8;
+                        raw[byte] |= 1u8 << bit;
+                    }
                 }
                 if let Some(nulls) = nulls {
-                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
+                    out.extend_from_slice(&null_len.to_le_bytes());
                     out.extend_from_slice(&nulls);
                 } else {
                     out.extend_from_slice(&0u32.to_le_bytes());
                 }
                 out.push(TABLE_COL_BOOL);
-                out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+                let raw_len = checked_u32_len(raw.len(), "bool bytes exceed u32::MAX")?;
+                out.extend_from_slice(&raw_len.to_le_bytes());
                 out.extend_from_slice(&raw);
             }
             (ColumnData::Utf8(values), ColumnType::Utf8) => {
@@ -1226,23 +1248,40 @@ fn encode_table_segment(
                 offsets.push(0);
                 for v in values {
                     if let Some(s) = v {
-                        data_bytes.extend_from_slice(s.as_bytes());
+                        let bytes = s.as_bytes();
+                        if data_bytes.len() + bytes.len() > u32::MAX as usize {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "utf8 data exceeds u32::MAX",
+                            ));
+                        }
+                        data_bytes.extend_from_slice(bytes);
                     }
                     offsets.push(data_bytes.len() as u32);
                 }
-                let mut blob = Vec::with_capacity(offsets.len() * 4 + data_bytes.len());
+                let offsets_bytes_len = offsets
+                    .len()
+                    .checked_mul(4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+                let blob_len = offsets_bytes_len
+                    .checked_add(data_bytes.len())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+                let blob_len_u32 =
+                    checked_u32_len(blob_len, "utf8 column bytes exceed u32::MAX")?;
+                let mut blob = Vec::with_capacity(blob_len);
                 for off in offsets {
                     blob.extend_from_slice(&off.to_le_bytes());
                 }
                 blob.extend_from_slice(&data_bytes);
                 if let Some(nulls) = nulls {
-                    out.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
+                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
+                    out.extend_from_slice(&null_len.to_le_bytes());
                     out.extend_from_slice(&nulls);
                 } else {
                     out.extend_from_slice(&0u32.to_le_bytes());
                 }
                 out.push(TABLE_COL_UTF8);
-                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                out.extend_from_slice(&blob_len_u32.to_le_bytes());
                 out.extend_from_slice(&blob);
             }
             _ => {
@@ -1379,7 +1418,7 @@ fn encode_series_segment(points: &[Point], min_seq: u64, max_seq: u64) -> io::Re
     if points.is_empty() {
         return Ok(Vec::new());
     }
-    let count = points.len() as u32;
+    let count = checked_u32_len(points.len(), "point count exceeds u32::MAX")?;
     let mut min_ts = points[0].ts_ms;
     let mut max_ts = points[0].ts_ms;
     let mut ts: Vec<i64> = Vec::with_capacity(points.len());
@@ -1391,6 +1430,8 @@ fn encode_series_segment(points: &[Point], min_seq: u64, max_seq: u64) -> io::Re
         values.extend_from_slice(&p.value.to_le_bytes());
     }
     let ts_bytes = TimeSeriesCompressor::compress(&ts);
+    let ts_len = checked_u32_len(ts_bytes.len(), "ts bytes exceed u32::MAX")?;
+    let values_len = checked_u32_len(values.len(), "values bytes exceed u32::MAX")?;
 
     let mut out = Vec::new();
     out.extend_from_slice(SEG_MAGIC);
@@ -1401,9 +1442,9 @@ fn encode_series_segment(points: &[Point], min_seq: u64, max_seq: u64) -> io::Re
     out.extend_from_slice(&min_ts.to_le_bytes());
     out.extend_from_slice(&max_ts.to_le_bytes());
     out.push(TS_CODEC_TS64);
-    out.extend_from_slice(&(ts_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ts_len.to_le_bytes());
     out.extend_from_slice(&ts_bytes);
-    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    out.extend_from_slice(&values_len.to_le_bytes());
     out.extend_from_slice(&values);
     Ok(out)
 }
@@ -1799,6 +1840,94 @@ mod tests {
                     assert_eq!(a.unwrap().to_bits(), b.unwrap().to_bits());
                 }
             }
+            _ => panic!("unexpected column type"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_bool_column_bit_packed() {
+        let path = fresh_db_path("bool_packed");
+        let storage = Storage::open(&path).unwrap();
+        let schema = TableSchema {
+            columns: vec![Column {
+                name: "b".to_string(),
+                col_type: ColumnType::Bool,
+            }],
+        };
+        storage.write_table_schema("t", &schema).unwrap();
+
+        let ts: Vec<i64> = (0..17).map(|i| 10_000 + i as i64).collect();
+        let values: Vec<Option<bool>> = vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(true),
+        ];
+        storage
+            .append_table_segment(
+                "t",
+                &schema,
+                &ts,
+                &[ColumnData::Bool(values.clone())],
+                1,
+                17,
+            )
+            .unwrap();
+
+        let idx = storage.load_or_rebuild_table_index("t").unwrap();
+        let entry = idx.first().unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&File::open(&storage.path).unwrap()).unwrap() };
+        let start = entry.offset as usize;
+        let end = start + entry.len as usize;
+
+        let mut data: &[u8] = &mmap[start..end];
+        fn take<'a>(data: &mut &'a [u8], n: usize) -> &'a [u8] {
+            let (h, t) = data.split_at(n);
+            *data = t;
+            h
+        }
+
+        assert_eq!(take(&mut data, 4), TABLE_MAGIC);
+        let _ = take(&mut data, 1)[0];
+        let _ = take(&mut data, 8 + 8 + 4 + 8 + 8); // seq/count/min/max
+        let ext_len = u16::from_le_bytes(take(&mut data, 2).try_into().unwrap()) as usize;
+        let _ = take(&mut data, ext_len);
+
+        assert_eq!(take(&mut data, 1)[0], TS_CODEC_TS64);
+        let ts_len = u32::from_le_bytes(take(&mut data, 4).try_into().unwrap()) as usize;
+        let _ = take(&mut data, ts_len);
+
+        let ncols = u16::from_le_bytes(take(&mut data, 2).try_into().unwrap());
+        assert_eq!(ncols, 1);
+
+        let null_len = u32::from_le_bytes(take(&mut data, 4).try_into().unwrap()) as usize;
+        let _ = take(&mut data, null_len);
+        let codec = take(&mut data, 1)[0];
+        assert_eq!(codec, TABLE_COL_BOOL);
+        let col_len = u32::from_le_bytes(take(&mut data, 4).try_into().unwrap()) as usize;
+        assert_eq!(col_len, (values.len() + 7) / 8);
+
+        let (out_ts, out_cols) = storage
+            .read_table_columns_in_range("t", &schema, ts[0], ts[ts.len() - 1])
+            .unwrap();
+        assert_eq!(out_ts.len(), ts.len());
+        match &out_cols[0] {
+            ColumnData::Bool(out_vals) => assert_eq!(out_vals, &values),
             _ => panic!("unexpected column type"),
         }
 

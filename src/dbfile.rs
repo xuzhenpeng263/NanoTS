@@ -111,6 +111,12 @@ pub fn append_record(path: &Path, record_type: u8, payload: &[u8]) -> io::Result
         .read(true)
         .open(path)?;
     let record_offset = file.seek(SeekFrom::End(0))?;
+    if payload.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "record payload too large",
+        ));
+    }
     let payload_len = payload.len() as u32;
     let mut header = [0u8; 5];
     header[0] = record_type;
@@ -175,21 +181,11 @@ where
         }
 
         let mut payload = vec![0u8; payload_len as usize];
-        if let Err(e) = reader.read_exact(&mut payload) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Ok(());
-            }
-            return Err(e);
-        }
+        reader.read_exact(&mut payload)?;
         offset += payload_len as u64;
 
         let mut checksum_buf = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut checksum_buf) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Ok(());
-            }
-            return Err(e);
-        }
+        reader.read_exact(&mut checksum_buf)?;
         offset += 4;
         let checksum = u32::from_le_bytes(checksum_buf);
 
@@ -231,4 +227,45 @@ pub fn temp_db_path(base: &Path, suffix: &str) -> PathBuf {
         out.set_file_name(stamp);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "nanots_dbfile_test_{}_{}_{}.ntt",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    #[test]
+    fn test_iter_records_truncated_checksum_is_error() {
+        let path = temp_path("trunc_checksum");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(FILE_MAGIC).unwrap();
+        file.write_all(&[FILE_VERSION]).unwrap();
+
+        let payload_len: u32 = 4;
+        let mut header = [0u8; 5];
+        header[0] = RECORD_META;
+        header[1..5].copy_from_slice(&payload_len.to_le_bytes());
+        file.write_all(&header).unwrap();
+        file.write_all(&[1, 2, 3, 4]).unwrap();
+        file.flush().unwrap();
+
+        let err = iter_records(&path, |_hdr, _payload| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(path);
+    }
 }
