@@ -53,7 +53,11 @@ These numbers are from local runs and synthetic data (perfect/smooth patterns). 
 ## Data model
 
 - A **table** has an implicit timestamp column `ts_ms: i64` (milliseconds).
-- Each table has **N value columns**, currently `f64` only (Float64 v0).
+- Each table has **N value columns**, supporting multiple types:
+  - `F64` (Float64)
+  - `I64` (Int64)
+  - `Bool` (Boolean)
+  - `Utf8` (String/UTF-8)
 - Data is appended as rows: `append_row(table, ts_ms, values[])`.
 
 Notes:
@@ -61,9 +65,11 @@ Notes:
 - `append(series, ts_ms, value)` is a convenience API that writes to a single-column table.
 - Schema is stored in the `.ntt` file (see [SPEC.md](SPEC.md)).
 
-## SQL (limited)
+## SQL (DataFusion integration)
 
-- Supported statements: `CREATE TABLE`, `INSERT INTO ... VALUES ...`
+- Full SQL support via DataFusion engine (read-only queries)
+- Supported statements: `CREATE TABLE`, `INSERT INTO ... VALUES ...`, `SELECT`, `WHERE`, `GROUP BY`, etc.
+- Built-in UDFs: `time_bucket(interval, timestamp)`, `delta(column)`, `rate(column)`
 - Identifiers may be unquoted or quoted using double quotes or backticks (e.g. `"my_table"`, `` `my_table` ``).
 
 ## Rust usage (detailed)
@@ -188,6 +194,36 @@ ts_ms, cols = db.query_table_range_columns("sensor", t0, t0 + 60000)
 print("rows:", len(ts_ms), "cols:", len(cols))
 ```
 
+### Typed tables (multiple data types)
+
+```python
+import nanots
+
+db = nanots.Db("./my_db.ntt")
+# Create table with mixed types
+db.create_table_typed("events", [
+    ("sensor_id", "i64"),
+    ("temperature", "f64"),
+    ("status", "bool"),
+    ("message", "utf8")
+])
+
+# Append typed data
+db.append_row_typed("events", 1704067200000, [
+    1001,           # sensor_id (i64)
+    25.5,           # temperature (f64)
+    True,           # status (bool)
+    "OK"            # message (utf8)
+])
+db.flush()
+
+# Query typed data
+ts_ms, cols = db.query_table_range_typed("events", 0, 10**18)
+print(f"Rows: {len(ts_ms)}")
+print(f"Sensor IDs: {cols[0][:5]}")  # i64 column
+print(f"Temperatures: {cols[1][:5]}")  # f64 column
+```
+
 ### Arrow zero-copy to PyArrow / Pandas
 
 ```python
@@ -259,6 +295,63 @@ import nanots
 
 db = nanots.Db("./my_db.ntt")
 db.pack_table("sensor", 8192)
+```
+
+### SQL queries (DataFusion integration)
+
+```python
+import nanots
+
+db = nanots.Db("./my_db.ntt")
+
+# Synchronous SQL to Pandas
+df = db.query_sql_to_pandas("SELECT * FROM sensor WHERE ts_ms > 1704067200000")
+print(df.head())
+
+# Synchronous SQL to Polars
+df_pl = db.query_sql_to_polars("SELECT time_bucket(60000, ts_ms) as bucket, AVG(temp) as avg_temp FROM sensor GROUP BY bucket ORDER BY bucket")
+print(df_pl)
+
+# Async SQL query
+import asyncio
+
+async def query_async():
+    capsule = await db.query_sql_async("SELECT * FROM events WHERE status = true")
+    # Process Arrow stream capsule...
+    pass
+
+asyncio.run(query_async())
+
+# Direct Arrow stream consumption
+capsule = db.query_sql_arrow_stream_capsule("SELECT COUNT(*) FROM sensor")
+import pyarrow
+reader = pyarrow.RecordBatchReader._import_from_c_capsule(capsule)
+for batch in reader:
+    print(batch.to_pandas())
+```
+
+### Database diagnostics
+
+```python
+import nanots
+
+db = nanots.Db("./my_db.ntt")
+
+# Get table statistics
+stats = db.stats("sensor")
+print(f"Rows: {stats['rows']}")
+print(f"Compression ratio: {stats['compression_ratio_total_x']:.2f}x")
+
+# Get database diagnostics
+diag = db.diagnose()
+print(f"WAL size: {diag['wal_bytes']} bytes")
+print(f"WAL ratio: {diag['wal_ratio']:.2f}")
+print(f"Pending rows: {diag['pending_rows']}")
+
+# Get table time range
+time_range = db.table_time_range("sensor")
+if time_range:
+    print(f"Time range: {time_range[0]} - {time_range[1]}")
 ```
 
 ## File format

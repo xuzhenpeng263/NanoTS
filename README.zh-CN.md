@@ -52,7 +52,11 @@
 ## 数据模型
 
 - 一个 **table** 有隐含时间列 `ts_ms: i64`（毫秒）。
-- 每个表有 **N 个取值列**，当前仅 `f64`（Float64 v0）。
+- 每个表有 **N 个取值列**，支持多种类型：
+  - `F64` (Float64)
+  - `I64` (Int64)
+  - `Bool` (Boolean)
+  - `Utf8` (String/UTF-8)
 - 数据按行追加：`append_row(table, ts_ms, values[])`。
 
 说明：
@@ -60,9 +64,11 @@
 - `append(series, ts_ms, value)` 是便捷 API，用于写单列表。
 - Schema 存在 `.ntt` 文件中（见 [SPEC.md](SPEC.md)）。
 
-## SQL（有限）
+## SQL（DataFusion 集成）
 
-- 支持语句：`CREATE TABLE`、`INSERT INTO ... VALUES ...`
+- 通过 DataFusion 引擎提供完整 SQL 支持（只读查询）
+- 支持语句：`CREATE TABLE`、`INSERT INTO ... VALUES ...`、`SELECT`、`WHERE`、`GROUP BY` 等
+- 内置 UDF：`time_bucket(interval, timestamp)`、`delta(column)`、`rate(column)`
 - 标识符可以不加引号，或使用双引号/反引号（例如：`"my_table"`、`` `my_table` ``）。
 
 ## Rust 用法（详细）
@@ -187,6 +193,36 @@ ts_ms, cols = db.query_table_range_columns("sensor", t0, t0 + 60000)
 print("rows:", len(ts_ms), "cols:", len(cols))
 ```
 
+### 类型化表（多数据类型）
+
+```python
+import nanots
+
+db = nanots.Db("./my_db.ntt")
+# 创建混合类型表
+db.create_table_typed("events", [
+    ("sensor_id", "i64"),
+    ("temperature", "f64"),
+    ("status", "bool"),
+    ("message", "utf8")
+])
+
+# 追加类型化数据
+db.append_row_typed("events", 1704067200000, [
+    1001,           # sensor_id (i64)
+    25.5,           # temperature (f64)
+    True,           # status (bool)
+    "OK"            # message (utf8)
+])
+db.flush()
+
+# 查询类型化数据
+ts_ms, cols = db.query_table_range_typed("events", 0, 10**18)
+print(f"行数: {len(ts_ms)}")
+print(f"传感器 ID: {cols[0][:5]}")  # i64 列
+print(f"温度: {cols[1][:5]}")  # f64 列
+```
+
 ### Arrow 零拷贝到 PyArrow / Pandas
 
 ```python
@@ -258,6 +294,63 @@ import nanots
 
 db = nanots.Db("./my_db.ntt")
 db.pack_table("sensor", 8192)
+```
+
+### SQL 查询（DataFusion 集成）
+
+```python
+import nanots
+
+db = nanots.Db("./my_db.ntt")
+
+# 同步 SQL 到 Pandas
+df = db.query_sql_to_pandas("SELECT * FROM sensor WHERE ts_ms > 1704067200000")
+print(df.head())
+
+# 同步 SQL 到 Polars
+df_pl = db.query_sql_to_polars("SELECT time_bucket(60000, ts_ms) as bucket, AVG(temp) as avg_temp FROM sensor GROUP BY bucket ORDER BY bucket")
+print(df_pl)
+
+# 异步 SQL 查询
+import asyncio
+
+async def query_async():
+    capsule = await db.query_sql_async("SELECT * FROM events WHERE status = true")
+    # 处理 Arrow stream capsule...
+    pass
+
+asyncio.run(query_async())
+
+# 直接消费 Arrow stream
+capsule = db.query_sql_arrow_stream_capsule("SELECT COUNT(*) FROM sensor")
+import pyarrow
+reader = pyarrow.RecordBatchReader._import_from_c_capsule(capsule)
+for batch in reader:
+    print(batch.to_pandas())
+```
+
+### 数据库诊断
+
+```python
+import nanots
+
+db = nanots.Db("./my_db.ntt")
+
+# 获取表统计信息
+stats = db.stats("sensor")
+print(f"行数: {stats['rows']}")
+print(f"压缩比: {stats['compression_ratio_total_x']:.2f}x")
+
+# 获取数据库诊断信息
+diag = db.diagnose()
+print(f"WAL 大小: {diag['wal_bytes']} 字节")
+print(f"WAL 比率: {diag['wal_ratio']:.2f}")
+print(f"待处理行数: {diag['pending_rows']}")
+
+# 获取表时间范围
+time_range = db.table_time_range("sensor")
+if time_range:
+    print(f"时间范围: {time_range[0]} - {time_range[1]}")
 ```
 
 ## 文件格式
