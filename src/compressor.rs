@@ -435,6 +435,9 @@ fn decompress_block_into(
         let exception_count = exception_count_u64 as usize;
 
         scratch.exceptions.clear();
+        if exception_count > body_len {
+            return Err("PFOR exception count exceeds body length");
+        }
         scratch.exceptions.reserve(exception_count);
 
         let mut idx_acc = 0usize;
@@ -443,8 +446,17 @@ fn decompress_block_into(
             let (idx_part_u64, new_pos) = uvarint_decode(payload, cursor)?;
             cursor = new_pos;
 
+            if idx_part_u64 > usize::MAX as u64 {
+                return Err("PFOR exception index overflow");
+            }
             let idx_part = idx_part_u64 as usize;
-            idx_acc = if i == 0 { idx_part } else { idx_acc + idx_part };
+            idx_acc = if i == 0 {
+                idx_part
+            } else {
+                idx_acc
+                    .checked_add(idx_part)
+                    .ok_or("PFOR exception index overflow")?
+            };
 
             let (val_part_u64, new_pos) = uvarint_decode(payload, cursor)?;
             cursor = new_pos;
@@ -956,6 +968,13 @@ impl TimeSeriesCompressor {
             return Ok(Vec::new());
         }
 
+        let min_block_bytes = 3usize;
+        let max_blocks = blob.len().saturating_sub(8) / min_block_bytes;
+        let max_count = max_blocks.saturating_mul(BLOCK_SIZE);
+        if n > max_count {
+            return Err("Declared count exceeds blob size");
+        }
+
         let mut out_arr = vec![0i64; n];
 
         let mut pos = 8usize;
@@ -985,10 +1004,10 @@ impl TimeSeriesCompressor {
             let (plen, new_pos) = uvarint_decode(blob, pos)?;
             pos = new_pos;
 
-            let plen_usize = plen as usize;
-            if pos + plen_usize > blob.len() {
+            if plen > (blob.len().saturating_sub(pos)) as u64 {
                 return Err("Payload exceeds blob size");
             }
+            let plen_usize = plen as usize;
             let payload_start = pos;
             let payload_end = pos + plen_usize;
 

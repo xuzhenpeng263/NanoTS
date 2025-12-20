@@ -29,3 +29,9 @@ import pyarrow.lib
 schema_capsule, array_capsule = db.query_table_range_arrow_capsules("sensor", t1, t2)
 batch = pyarrow.lib.RecordBatch._import_from_c_capsule(schema_capsule, array_capsule)
 ```
+
+## Power loss simulation
+
+```bash
+python test_power_loss.py --reset --rounds 20
+```
