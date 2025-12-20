@@ -219,6 +219,29 @@ schema_capsule, array_capsule = batch.__arrow_c_array__()
 db.append_rows_arrow_capsules("sensor", schema_capsule, array_capsule)
 ```
 
+### C API 批量写入（行主序）
+
+```c
+#include "nanots.h"
+
+int main(void) {
+  NanotsHandle* db = nanots_open("./my_db.ntt", -1);
+  const char* cols[] = {"a", "b"};
+  nanots_create_table(db, "t", cols, 2);
+
+  int64_t ts[] = {1000, 1001, 1002};
+  double vals[] = {
+      1.0, 2.0,
+      3.0, 4.0,
+      5.0, 6.0,
+  };
+  nanots_append_rows(db, "t", ts, 3, vals, 2);
+  nanots_flush(db);
+  nanots_close(db);
+  return 0;
+}
+```
+
 ### Stats（空间统计与 codec 验证）
 
 ```python

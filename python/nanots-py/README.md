@@ -55,6 +55,7 @@ Notes:
 
 - This path uses a batch append internally (columnar), avoiding per-row Python/Rust overhead.
 - Column names must match the table schema; include all columns in order.
+- For Float64-only tables, `ts_ms` + all value columns must be present.
 
 ## Auto maintenance options
 

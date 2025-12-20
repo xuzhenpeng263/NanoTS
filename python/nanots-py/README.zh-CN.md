@@ -55,6 +55,7 @@ db.append_rows_arrow_capsules("sensor", schema_capsule, array_capsule)
 
 - 该路径在内部使用批量写入（列式），避免逐行 Python/Rust 调用开销。
 - 列名必须与表 schema 匹配，并包含所有列（按顺序）。
+- 对于 Float64-only 表，必须包含 `ts_ms` + 所有 value 列。
 
 ## 自动维护选项
 

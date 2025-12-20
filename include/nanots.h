@@ -70,6 +70,10 @@ int64_t nanots_append_row(
 // `ts_ms` has `nrows` entries.
 // `values` is row-major with length `nrows * ncols`:
 //   values[row * ncols + col]
+// Example (2 rows, 2 cols):
+//   int64_t ts[] = {1000, 1001};
+//   double vals[] = {1.0, 2.0, 3.0, 4.0}; // row-major
+//   nanots_append_rows(db, "t", ts, 2, vals, 2);
 // Returns number of appended rows on success, or a negative error code.
 int64_t nanots_append_rows(
     NanotsHandle* handle,
