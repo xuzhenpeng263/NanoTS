@@ -189,7 +189,7 @@ Then repeated `ncols` times:
 - `null_bytes`: `null_len` bytes (validity bitmap, LSB-first)
 - `col_codec`: u8
   - `2` = `TABLE_COL_F64_XOR` (Gorilla XOR-style)
-  - `3` = `TABLE_COL_I64_D2` (compressed `i64`)
+  - `3` = `TABLE_COL_I64_D2` (compressed `i64`, also used for `F64` columns when all values are integral)
   - `4` = `TABLE_COL_BOOL` (bit-packed bools, LSB-first)
   - `5` = `TABLE_COL_UTF8` (dictionary + indices)
 - `col_len`: u32 (bytes)

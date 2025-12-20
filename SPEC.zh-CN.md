@@ -163,7 +163,7 @@ Extension header（v1+）：
 - `null_bytes`：`null_len` bytes（有效位图，LSB-first）
 - `col_codec`：u8
   - `2` = `TABLE_COL_F64_XOR`（Gorilla XOR 风格）
-  - `3` = `TABLE_COL_I64_D2`（`i64` 压缩存储）
+  - `3` = `TABLE_COL_I64_D2`（`i64` 压缩存储；当 `F64` 列全为整数时也会使用）
   - `4` = `TABLE_COL_BOOL`（bool 位图，低位在前）
   - `5` = `TABLE_COL_UTF8`（字典 + 索引）
 - `col_len`：u32（bytes）
