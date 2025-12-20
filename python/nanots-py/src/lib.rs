@@ -728,7 +728,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 #[pymodule]
-fn nanots(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn nanots_db(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Db>()?;
     Ok(())

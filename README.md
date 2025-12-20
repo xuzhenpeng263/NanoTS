@@ -163,15 +163,15 @@ cd python/nanots-py
 maturin develop --release
 ```
 
-This installs a local `nanots` extension module into the active Python environment.
-Type hints are included via `python/nanots-py/nanots.pyi`.
+This installs a local `nanots_db` extension module into the active Python environment.
+Type hints are included via `python/nanots-py/nanots_db.pyi`.
 
 ### Basic write & flush
 
 ```python
-import nanots
+import nanots_db_db
 
-db = nanots.Db("./my_db.ntt", 3600 * 1000)  # retention: 1 hour (ms)
+db = nanots_db.Db("./my_db.ntt", 3600 * 1000)  # retention: 1 hour (ms)
 db.append("sensor_x", 1704067200000, 25.5)
 db.flush()
 ```
@@ -179,7 +179,7 @@ db.flush()
 ### Multi-column tables
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 db.create_table("sensor", ["temp", "humidity"])
@@ -197,7 +197,7 @@ print("rows:", len(ts_ms), "cols:", len(cols))
 ### Typed tables (multiple data types)
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 # Create table with mixed types
@@ -227,7 +227,7 @@ print(f"Temperatures: {cols[1][:5]}")  # f64 column
 ### Arrow zero-copy to PyArrow / Pandas
 
 ```python
-import nanots
+import nanots_db
 import pyarrow.lib
 
 db = nanots.Db("./my_db.ntt")
@@ -241,7 +241,7 @@ print(df.head())
 ### Arrow batch append (from PyArrow)
 
 ```python
-import nanots
+import nanots_db
 import pyarrow as pa
 
 db = nanots.Db("./my_db.ntt")
@@ -282,7 +282,7 @@ int main(void) {
 ### Stats (space accounting & codec verification)
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 print(db.stats("sensor"))
@@ -291,7 +291,7 @@ print(db.stats("sensor"))
 ### Manual pack / compaction
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 db.pack_table("sensor", 8192)
@@ -300,7 +300,7 @@ db.pack_table("sensor", 8192)
 ### SQL queries (DataFusion integration)
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 
@@ -333,7 +333,7 @@ for batch in reader:
 ### Database diagnostics
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 

@@ -162,13 +162,13 @@ cd python/nanots-py
 maturin develop --release
 ```
 
-该命令会将本地 `nanots` 扩展模块安装到当前 Python 环境。
-类型提示位于 `python/nanots-py/nanots.pyi`。
+该命令会将本地 `nanots_db` 扩展模块安装到当前 Python 环境。
+类型提示位于 `python/nanots-py/nanots_db.pyi`。
 
 ### 基础写入与 flush
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt", 3600 * 1000)  # retention: 1 小时（毫秒）
 db.append("sensor_x", 1704067200000, 25.5)
@@ -178,7 +178,7 @@ db.flush()
 ### 多列表
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 db.create_table("sensor", ["temp", "humidity"])
@@ -196,7 +196,7 @@ print("rows:", len(ts_ms), "cols:", len(cols))
 ### 类型化表（多数据类型）
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 # 创建混合类型表
@@ -226,7 +226,7 @@ print(f"温度: {cols[1][:5]}")  # f64 列
 ### Arrow 零拷贝到 PyArrow / Pandas
 
 ```python
-import nanots
+import nanots_db
 import pyarrow.lib
 
 db = nanots.Db("./my_db.ntt")
@@ -240,7 +240,7 @@ print(df.head())
 ### Arrow 批量写入（来自 PyArrow）
 
 ```python
-import nanots
+import nanots_db
 import pyarrow as pa
 
 db = nanots.Db("./my_db.ntt")
@@ -281,7 +281,7 @@ int main(void) {
 ### Stats（空间统计与 codec 验证）
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 print(db.stats("sensor"))
@@ -290,7 +290,7 @@ print(db.stats("sensor"))
 ### 手动 pack / compaction
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 db.pack_table("sensor", 8192)
@@ -299,7 +299,7 @@ db.pack_table("sensor", 8192)
 ### SQL 查询（DataFusion 集成）
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 
@@ -332,7 +332,7 @@ for batch in reader:
 ### 数据库诊断
 
 ```python
-import nanots
+import nanots_db
 
 db = nanots.Db("./my_db.ntt")
 
