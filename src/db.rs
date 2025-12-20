@@ -927,6 +927,33 @@ impl NanoTsDb {
         Ok(appended)
     }
 
+    #[cfg(feature = "arrow")]
+    pub fn append_table_batch_arrow(
+        &mut self,
+        table: &str,
+        schema: *mut crate::arrow::ArrowSchema,
+        array: *mut crate::arrow::ArrowArray,
+    ) -> io::Result<u64> {
+        let batch = crate::arrow::import_ts_table_from_c(schema, array).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("arrow import failed: {}", e))
+        })?;
+        let schema = self.table_schema(table)?;
+        let mut column_map = batch.columns;
+        let mut cols: Vec<ColumnData> = Vec::with_capacity(schema.columns.len());
+        for col in &schema.columns {
+            let data = column_map
+                .remove(&col.name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing column {}", col.name),
+                    )
+                })?;
+            cols.push(data);
+        }
+        self.append_table_batch(table, &batch.ts_ms, &cols)
+    }
+
     fn append_row_values(
         &mut self,
         table: &str,
@@ -2019,6 +2046,50 @@ mod tests {
         assert_eq!(out_ts, ts);
         match &out_cols[0] {
             ColumnData::F64(v) => assert_eq!(v[0], Some(1.0)),
+            _ => panic!("unexpected column type"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_append_table_batch_arrow() {
+        let path = fresh_db_path("append_table_batch_arrow");
+        let mut db = NanoTsDb::open(&path, NanoTsOptions::default()).unwrap();
+        db.create_table_typed(
+            "t",
+            &[
+                ("temp", ColumnType::F64),
+                ("flag", ColumnType::Bool),
+                ("tag", ColumnType::Utf8),
+            ],
+        )
+        .unwrap();
+
+        let ts = vec![1000, 1001, 1002];
+        let cols = vec![
+            ("temp", ColumnData::F64(vec![Some(1.0), Some(2.0), None])),
+            ("flag", ColumnData::Bool(vec![Some(true), None, Some(false)])),
+            (
+                "tag",
+                ColumnData::Utf8(vec![
+                    Some("a".to_string()),
+                    None,
+                    Some("b".to_string()),
+                ]),
+            ),
+        ];
+        let mut batch = crate::arrow::ArrowBatch::from_ts_columns("t", ts.clone(), cols).unwrap();
+        let appended = db
+            .append_table_batch_arrow("t", batch.schema_ptr(), batch.array_ptr())
+            .unwrap();
+        assert_eq!(appended, 3);
+        db.flush().unwrap();
+
+        let (out_ts, out_cols) = db.query_table_range_typed("t", 0, 10_000).unwrap();
+        assert_eq!(out_ts, ts);
+        match &out_cols[0] {
+            ColumnData::F64(v) => assert_eq!(v[1], Some(2.0)),
             _ => panic!("unexpected column type"),
         }
         let _ = fs::remove_file(path);

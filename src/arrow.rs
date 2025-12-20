@@ -8,6 +8,7 @@
 // - value columns: Float64/Int64/Bool/Utf8 (formats "g"/"l"/"b"/"u")
 
 use crate::db::ColumnData;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,6 +40,7 @@ pub struct ArrowSchema {
     pub private_data: *mut c_void,
 }
 
+#[derive(Debug)]
 pub struct ArrowExportError;
 
 pub struct ArrowBatch {
@@ -651,4 +653,347 @@ pub fn export_ts_f64_table_to_c(
         })
         .collect();
     export_ts_table_to_c(root_name, ts_ms, cols, out_array, out_schema)
+}
+
+#[derive(Debug)]
+pub enum ArrowImportError {
+    NullPointer(&'static str),
+    InvalidFormat(&'static str),
+    InvalidData(&'static str),
+    Utf8,
+}
+
+impl std::fmt::Display for ArrowImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArrowImportError::NullPointer(what) => write!(f, "null pointer: {}", what),
+            ArrowImportError::InvalidFormat(what) => write!(f, "invalid format: {}", what),
+            ArrowImportError::InvalidData(what) => write!(f, "invalid data: {}", what),
+            ArrowImportError::Utf8 => write!(f, "invalid utf-8 data"),
+        }
+    }
+}
+
+impl std::error::Error for ArrowImportError {}
+
+pub struct ArrowImportBatch {
+    pub ts_ms: Vec<i64>,
+    pub columns: HashMap<String, ColumnData>,
+}
+
+struct ArrowReleaseGuard {
+    array: *mut ArrowArray,
+    schema: *mut ArrowSchema,
+}
+
+impl Drop for ArrowReleaseGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.array.is_null() {
+                if let Some(release) = (*self.array).release {
+                    release(self.array);
+                }
+            }
+            if !self.schema.is_null() {
+                if let Some(release) = (*self.schema).release {
+                    release(self.schema);
+                }
+            }
+        }
+    }
+}
+
+fn cstr_to_string(ptr: *const c_char) -> Result<String, ArrowImportError> {
+    if ptr.is_null() {
+        return Err(ArrowImportError::NullPointer("schema format/name"));
+    }
+    unsafe {
+        std::ffi::CStr::from_ptr(ptr)
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|_| ArrowImportError::Utf8)
+    }
+}
+
+fn bitmap_is_set(bitmap: &[u8], idx: usize) -> bool {
+    let byte = idx / 8;
+    let bit = idx % 8;
+    if byte >= bitmap.len() {
+        return false;
+    }
+    (bitmap[byte] & (1u8 << bit)) != 0
+}
+
+fn array_buffers(array: &ArrowArray) -> Result<&[*const c_void], ArrowImportError> {
+    if array.n_buffers < 0 {
+        return Err(ArrowImportError::InvalidData("negative buffer count"));
+    }
+    if array.n_buffers == 0 {
+        return Ok(&[]);
+    }
+    if array.buffers.is_null() {
+        return Err(ArrowImportError::NullPointer("buffers"));
+    }
+    let len = array.n_buffers as usize;
+    Ok(unsafe { std::slice::from_raw_parts(array.buffers, len) })
+}
+
+fn validity_bitmap<'a>(
+    array: &ArrowArray,
+    buffers: &'a [*const c_void],
+    len: usize,
+    offset: usize,
+) -> Result<Option<&'a [u8]>, ArrowImportError> {
+    if array.null_count == 0 {
+        return Ok(None);
+    }
+    if buffers.is_empty() {
+        return Err(ArrowImportError::InvalidData("missing validity buffer"));
+    }
+    let ptr = buffers[0] as *const u8;
+    if ptr.is_null() {
+        return Err(ArrowImportError::InvalidData("null validity buffer"));
+    }
+    let bytes = (offset + len + 7) / 8;
+    Ok(Some(unsafe { std::slice::from_raw_parts(ptr, bytes) }))
+}
+
+fn read_i64_column(array: &ArrowArray) -> Result<Vec<Option<i64>>, ArrowImportError> {
+    let len = array.length;
+    if len < 0 || array.offset < 0 {
+        return Err(ArrowImportError::InvalidData("negative length/offset"));
+    }
+    let len = len as usize;
+    let offset = array.offset as usize;
+    let buffers = array_buffers(array)?;
+    if buffers.len() < 2 {
+        return Err(ArrowImportError::InvalidData("missing data buffer"));
+    }
+    let data_ptr = buffers[1] as *const i64;
+    if data_ptr.is_null() {
+        return Err(ArrowImportError::InvalidData("null data buffer"));
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, offset + len) };
+    let validity = validity_bitmap(array, &buffers, len, offset)?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let idx = offset + i;
+        if validity.map(|b| bitmap_is_set(b, idx)).unwrap_or(true) {
+            out.push(Some(data[idx]));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
+}
+
+fn read_f64_column(array: &ArrowArray) -> Result<Vec<Option<f64>>, ArrowImportError> {
+    let len = array.length;
+    if len < 0 || array.offset < 0 {
+        return Err(ArrowImportError::InvalidData("negative length/offset"));
+    }
+    let len = len as usize;
+    let offset = array.offset as usize;
+    let buffers = array_buffers(array)?;
+    if buffers.len() < 2 {
+        return Err(ArrowImportError::InvalidData("missing data buffer"));
+    }
+    let data_ptr = buffers[1] as *const f64;
+    if data_ptr.is_null() {
+        return Err(ArrowImportError::InvalidData("null data buffer"));
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, offset + len) };
+    let validity = validity_bitmap(array, &buffers, len, offset)?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let idx = offset + i;
+        if validity.map(|b| bitmap_is_set(b, idx)).unwrap_or(true) {
+            out.push(Some(data[idx]));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
+}
+
+fn read_bool_column(array: &ArrowArray) -> Result<Vec<Option<bool>>, ArrowImportError> {
+    let len = array.length;
+    if len < 0 || array.offset < 0 {
+        return Err(ArrowImportError::InvalidData("negative length/offset"));
+    }
+    let len = len as usize;
+    let offset = array.offset as usize;
+    let buffers = array_buffers(array)?;
+    if buffers.len() < 2 {
+        return Err(ArrowImportError::InvalidData("missing data buffer"));
+    }
+    let data_ptr = buffers[1] as *const u8;
+    if data_ptr.is_null() {
+        return Err(ArrowImportError::InvalidData("null data buffer"));
+    }
+    let data_len = (offset + len + 7) / 8;
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    let validity = validity_bitmap(array, &buffers, len, offset)?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let idx = offset + i;
+        if validity.map(|b| bitmap_is_set(b, idx)).unwrap_or(true) {
+            out.push(Some(bitmap_is_set(data, idx)));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
+}
+
+fn read_utf8_column(array: &ArrowArray) -> Result<Vec<Option<String>>, ArrowImportError> {
+    let len = array.length;
+    if len < 0 || array.offset < 0 {
+        return Err(ArrowImportError::InvalidData("negative length/offset"));
+    }
+    let len = len as usize;
+    let offset = array.offset as usize;
+    let buffers = array_buffers(array)?;
+    if buffers.len() < 3 {
+        return Err(ArrowImportError::InvalidData("missing utf8 buffers"));
+    }
+    let offsets_ptr = buffers[1] as *const i32;
+    let data_ptr = buffers[2] as *const u8;
+    if offsets_ptr.is_null() || data_ptr.is_null() {
+        return Err(ArrowImportError::InvalidData("null utf8 buffers"));
+    }
+    let offsets_len = offset + len + 1;
+    let offsets = unsafe { std::slice::from_raw_parts(offsets_ptr, offsets_len) };
+    let last = offsets[offset + len];
+    if last < 0 {
+        return Err(ArrowImportError::InvalidData("negative utf8 offset"));
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, last as usize) };
+    let validity = validity_bitmap(array, &buffers, len, offset)?;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let idx = offset + i;
+        if !validity.map(|b| bitmap_is_set(b, idx)).unwrap_or(true) {
+            out.push(None);
+            continue;
+        }
+        let start = offsets[idx];
+        let end = offsets[idx + 1];
+        if start < 0 || end < start {
+            return Err(ArrowImportError::InvalidData("bad utf8 offsets"));
+        }
+        let start = start as usize;
+        let end = end as usize;
+        if end > data.len() {
+            return Err(ArrowImportError::InvalidData("utf8 offset out of bounds"));
+        }
+        let s = std::str::from_utf8(&data[start..end]).map_err(|_| ArrowImportError::Utf8)?;
+        out.push(Some(s.to_string()));
+    }
+    Ok(out)
+}
+
+/// Imports a table-like Arrow StructArray from the C Data Interface.
+/// Consumes `array`/`schema` by calling their `release` callbacks on return.
+pub fn import_ts_table_from_c(
+    schema: *mut ArrowSchema,
+    array: *mut ArrowArray,
+) -> Result<ArrowImportBatch, ArrowImportError> {
+    if schema.is_null() {
+        return Err(ArrowImportError::NullPointer("schema"));
+    }
+    if array.is_null() {
+        return Err(ArrowImportError::NullPointer("array"));
+    }
+    let _guard = ArrowReleaseGuard { array, schema };
+    let schema_ref = unsafe { &*schema };
+    let array_ref = unsafe { &*array };
+    if array_ref.length < 0 || array_ref.offset < 0 {
+        return Err(ArrowImportError::InvalidData("negative root length/offset"));
+    }
+    let format = cstr_to_string(schema_ref.format)?;
+    if format != "+s" {
+        return Err(ArrowImportError::InvalidFormat("root must be struct (+s)"));
+    }
+    if schema_ref.n_children < 0 || array_ref.n_children < 0 {
+        return Err(ArrowImportError::InvalidData("negative child count"));
+    }
+    if schema_ref.n_children != array_ref.n_children {
+        return Err(ArrowImportError::InvalidData("child count mismatch"));
+    }
+    if array_ref.null_count != 0 {
+        return Err(ArrowImportError::InvalidData("root struct contains nulls"));
+    }
+    let n_children = schema_ref.n_children as usize;
+    if n_children == 0 {
+        return Err(ArrowImportError::InvalidData("empty struct"));
+    }
+    if schema_ref.children.is_null() || array_ref.children.is_null() {
+        return Err(ArrowImportError::NullPointer("children"));
+    }
+    let schema_children = unsafe { std::slice::from_raw_parts(schema_ref.children, n_children) };
+    let array_children = unsafe { std::slice::from_raw_parts(array_ref.children, n_children) };
+    let mut ts_ms: Option<Vec<i64>> = None;
+    let mut columns: HashMap<String, ColumnData> = HashMap::new();
+    for (child_schema_ptr, child_array_ptr) in
+        schema_children.iter().zip(array_children.iter())
+    {
+        if child_schema_ptr.is_null() || child_array_ptr.is_null() {
+            return Err(ArrowImportError::NullPointer("child"));
+        }
+        let child_schema = unsafe { &**child_schema_ptr };
+        let child_array = unsafe { &**child_array_ptr };
+        let name = cstr_to_string(child_schema.name)?;
+        let child_format = cstr_to_string(child_schema.format)?;
+        let len = child_array.length;
+        if len < 0 {
+            return Err(ArrowImportError::InvalidData("negative child length"));
+        }
+        if (len as usize) != array_ref.length as usize {
+            return Err(ArrowImportError::InvalidData("child length mismatch"));
+        }
+        match child_format.as_str() {
+            "l" => {
+                let values = read_i64_column(child_array)?;
+                if name == "ts_ms" || name == "ts" {
+                    if values.iter().any(|v| v.is_none()) {
+                        return Err(ArrowImportError::InvalidData("ts_ms contains nulls"));
+                    }
+                    ts_ms = Some(values.into_iter().map(|v| v.unwrap()).collect());
+                } else {
+                    columns.insert(name, ColumnData::I64(values));
+                }
+            }
+            "g" => {
+                let values = read_f64_column(child_array)?;
+                columns.insert(name, ColumnData::F64(values));
+            }
+            "b" => {
+                let values = read_bool_column(child_array)?;
+                columns.insert(name, ColumnData::Bool(values));
+            }
+            "u" => {
+                let values = read_utf8_column(child_array)?;
+                columns.insert(name, ColumnData::Utf8(values));
+            }
+            _ => {
+                return Err(ArrowImportError::InvalidFormat(
+                    "unsupported child format",
+                ));
+            }
+        }
+    }
+    let ts_ms = ts_ms.ok_or(ArrowImportError::InvalidData("missing ts_ms"))?;
+    for col in columns.values() {
+        let len = match col {
+            ColumnData::F64(v) => v.len(),
+            ColumnData::I64(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::Utf8(v) => v.len(),
+        };
+        if len != ts_ms.len() {
+            return Err(ArrowImportError::InvalidData("column length mismatch"));
+        }
+    }
+    Ok(ArrowImportBatch { ts_ms, columns })
 }

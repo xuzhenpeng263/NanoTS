@@ -83,6 +83,15 @@ int64_t nanots_append_rows(
     const double* values,
     size_t ncols);
 
+// Appends rows from Arrow C Data Interface (struct with ts_ms + table columns).
+// On success or failure, this function calls `array->release(array)` and
+// `schema->release(schema)` to consume the passed ownership.
+int64_t nanots_append_rows_arrow(
+    NanotsHandle* handle,
+    const char* table,
+    struct ArrowSchema* schema,
+    struct ArrowArray* array);
+
 // Queries points in [start_ms, end_ms]. Returns a heap-allocated array and writes its length to `out_len`.
 // Free the returned pointer with `nanots_query_free`.
 NanotsPoint* nanots_query_range(

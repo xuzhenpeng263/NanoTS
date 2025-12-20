@@ -209,6 +209,33 @@ pub extern "C" fn nanots_append_rows(
     }
 }
 
+#[cfg(feature = "arrow")]
+#[no_mangle]
+pub extern "C" fn nanots_append_rows_arrow(
+    handle: *mut NanotsHandle,
+    table: *const c_char,
+    schema: *mut ArrowSchema,
+    array: *mut ArrowArray,
+) -> c_longlong {
+    if handle.is_null() {
+        return -2;
+    }
+    let Ok(table) = cstr_to_string(table) else {
+        return -3;
+    };
+    if schema.is_null() || array.is_null() {
+        return -2;
+    }
+    let handle = unsafe { &*handle };
+    let Ok(mut db) = handle.db.lock() else {
+        return -4;
+    };
+    match db.append_table_batch_arrow(&table, schema, array) {
+        Ok(rows) => rows as c_longlong,
+        Err(_) => -1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn nanots_query_range(
     handle: *mut NanotsHandle,
