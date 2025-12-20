@@ -5,7 +5,7 @@ use crate::wal::{Wal, WalRecord, WalRecordOwned, WalValue};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 
@@ -19,6 +19,7 @@ pub struct Point {
 pub struct NanoTsOptions {
     pub retention: Option<Duration>,
     pub block_points: usize,
+    pub auto_maintenance: Option<AutoMaintenanceOptions>,
 }
 
 impl Default for NanoTsOptions {
@@ -26,6 +27,28 @@ impl Default for NanoTsOptions {
         Self {
             retention: None,
             block_points: 1024,
+            auto_maintenance: Some(AutoMaintenanceOptions::default()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoMaintenanceOptions {
+    pub check_interval: Duration,
+    pub retention_check_interval: Duration,
+    pub wal_target_ratio: u64,
+    pub wal_min_bytes: u64,
+    pub target_segment_points: usize,
+}
+
+impl Default for AutoMaintenanceOptions {
+    fn default() -> Self {
+        Self {
+            check_interval: Duration::from_secs(5),
+            retention_check_interval: Duration::from_secs(60),
+            wal_target_ratio: 2,
+            wal_min_bytes: 32 * 1024 * 1024,
+            target_segment_points: 8192,
         }
     }
 }
@@ -401,6 +424,7 @@ pub struct NanoTsDb {
     wal: Wal,
     meta: Meta,
     next_seq: u64,
+    wal_bytes: u64,
     options: NanoTsOptions,
     tables: HashMap<String, TableBuffer>,
 }
@@ -412,10 +436,15 @@ pub struct NanoTsDbShared {
 
 impl NanoTsDbShared {
     pub fn open(root: impl AsRef<Path>, options: NanoTsOptions) -> io::Result<Self> {
+        let auto_opts = options.auto_maintenance.clone();
         let db = NanoTsDb::open(root, options)?;
-        Ok(Self {
+        let shared = Self {
             inner: Arc::new(RwLock::new(db)),
-        })
+        };
+        if let Some(opts) = auto_opts {
+            spawn_auto_maintenance(Arc::downgrade(&shared.inner), opts);
+        }
+        Ok(shared)
     }
 
     pub fn with_read<F, R>(&self, f: F) -> io::Result<R>
@@ -459,12 +488,14 @@ impl NanoTsDb {
         meta.last_seq = meta.last_seq.max(disk_max_seq);
 
         let wal = Wal::open(&root)?;
+        let wal_bytes = wal.bytes_since_checkpoint()?;
 
         let mut db = Self {
             storage,
             wal,
             meta,
             next_seq: 1,
+            wal_bytes,
             options,
             tables: HashMap::new(),
         };
@@ -645,20 +676,22 @@ impl NanoTsDb {
                     }
                 }
             }
-            self.wal.append(WalRecord::AppendRow {
+            let wal_bytes = self.wal.append_with_size(WalRecord::AppendRow {
                 seq,
                 table,
                 ts_ms,
                 values: &raw,
             })?;
+            self.wal_bytes = self.wal_bytes.saturating_add(wal_bytes);
         } else {
             let wal_values = values.iter().map(to_wal_value).collect::<Vec<_>>();
-            self.wal.append(WalRecord::AppendRowTyped {
+            let wal_bytes = self.wal.append_with_size(WalRecord::AppendRowTyped {
                 seq,
                 table,
                 ts_ms,
                 values: &wal_values,
             })?;
+            self.wal_bytes = self.wal_bytes.saturating_add(wal_bytes);
         }
 
         let buf = self.tables.get_mut(table).unwrap();
@@ -686,6 +719,7 @@ impl NanoTsDb {
             self.storage.write_table_index(t)?;
         }
         self.wal.reset()?;
+        self.wal_bytes = 0;
         Ok(())
     }
 
@@ -1241,6 +1275,54 @@ impl NanoTsDb {
         self.storage.pack_table(table, target_segment_points)?;
         Ok(())
     }
+
+    fn pack_all_tables(&mut self, target_segment_points: usize) -> io::Result<()> {
+        self.flush()?;
+        for table in self.storage.list_tables()? {
+            self.storage.pack_table(&table, target_segment_points)?;
+        }
+        Ok(())
+    }
+
+    fn should_auto_pack(&self, opts: &AutoMaintenanceOptions) -> io::Result<bool> {
+        if self.wal_bytes < opts.wal_min_bytes {
+            return Ok(false);
+        }
+        let total_bytes = self.storage.total_table_segment_bytes()?;
+        if total_bytes == 0 {
+            return Ok(false);
+        }
+        Ok(self.wal_bytes >= total_bytes.saturating_mul(opts.wal_target_ratio))
+    }
+}
+
+fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptions) {
+    std::thread::spawn(move || {
+        let mut last_retention = std::time::Instant::now()
+            .checked_sub(opts.retention_check_interval)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            std::thread::sleep(opts.check_interval);
+            let Some(db) = db.upgrade() else { break };
+            let mut guard = match db.write() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
+            if guard.options.retention.is_some()
+                && last_retention.elapsed() >= opts.retention_check_interval
+            {
+                let _ = guard.compact_retention_now();
+                last_retention = std::time::Instant::now();
+            }
+            let should_pack = match guard.should_auto_pack(&opts) {
+                Ok(should_pack) => should_pack,
+                Err(_) => continue,
+            };
+            if should_pack {
+                let _ = guard.pack_all_tables(opts.target_segment_points);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1248,6 +1330,7 @@ mod tests {
     use super::*;
     use crate::dbfile;
     use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1339,6 +1422,50 @@ mod tests {
             assert_eq!(cols[0][0], 1.0);
             assert_eq!(cols[0][1], 2.0);
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_table_checksum_enforced_on_read() {
+        let path = fresh_db_path("checksum_read");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table("t", &["v"]).unwrap();
+            for i in 0..10i64 {
+                db.append_row("t", 1000 + i, &[i as f64]).unwrap();
+            }
+            db.flush().unwrap();
+        }
+        let db = NanoTsDb::open(&path, opts).unwrap();
+
+        let mut checksum_offset: Option<u64> = None;
+        dbfile::iter_records(&path, |hdr, _| {
+            if hdr.record_type == dbfile::RECORD_TABLE_SEGMENT && checksum_offset.is_none() {
+                checksum_offset = Some(hdr.payload_offset + hdr.payload_len as u64);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let checksum_offset = checksum_offset.expect("table segment checksum offset");
+
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(checksum_offset)).unwrap();
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b).unwrap();
+        file.seek(SeekFrom::Start(checksum_offset)).unwrap();
+        b[0] ^= 0xff;
+        file.write_all(&b).unwrap();
+        file.flush().unwrap();
+
+        let err = db
+            .query_table_range_columns("t", 0, 10_000)
+            .expect_err("checksum corruption should fail read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_file(path);
     }
 

@@ -37,7 +37,7 @@ pub struct RecordHeader {
     pub payload_offset: u64,
 }
 
-fn fnv1a32(bytes: &[u8]) -> u32 {
+pub(crate) fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9dc5;
     for &b in bytes {
         hash ^= b as u32;

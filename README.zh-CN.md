@@ -120,6 +120,20 @@ db.pack_table("sensor", 8192)?;
 # Ok::<(), std::io::Error>(())
 ```
 
+### 自动维护（后台 Pack + Retention）
+
+```rust
+use nanots::{AutoMaintenanceOptions, NanoTsDbShared, NanoTsOptions};
+use std::time::Duration;
+
+let opts = NanoTsOptions {
+    retention: Some(Duration::from_secs(3600)),
+    auto_maintenance: Some(AutoMaintenanceOptions::default()),
+    ..Default::default()
+};
+let db = NanoTsDbShared::open("data/nanots.ntt", opts)?;
+```
+
 ### Rust 接口速查
 
 - `NanoTsDb::open(path, opts)`：打开/创建 DB 目录

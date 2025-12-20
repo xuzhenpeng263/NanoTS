@@ -14,3 +14,7 @@ openb_pod_list*/
 python/nanots-py/target/
 python/nanots-py/__pycache__/
 python/nanots-py/*.egg-info/
+fuzz/corpus/
+fuzz/artifacts
+logs
+data

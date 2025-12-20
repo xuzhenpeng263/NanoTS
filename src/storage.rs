@@ -102,6 +102,21 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn table_segment_bytes(&self, table: &str) -> io::Result<u64> {
+        let index = self.load_or_rebuild_table_index(table)?;
+        Ok(index
+            .iter()
+            .fold(0u64, |acc, e| acc.saturating_add(e.len)))
+    }
+
+    pub fn total_table_segment_bytes(&self) -> io::Result<u64> {
+        let mut total = 0u64;
+        for table in self.list_tables()? {
+            total = total.saturating_add(self.table_segment_bytes(&table)?);
+        }
+        Ok(total)
+    }
+
     pub fn write_table_schema(&self, table: &str, schema: &TableSchema) -> io::Result<()> {
         let schema_bytes = encode_table_schema_bytes(schema)?;
         let payload = encode_named_payload(table, &schema_bytes)?;
@@ -377,6 +392,7 @@ impl Storage {
                     "table index range out of bounds",
                 ));
             }
+            verify_table_segment_checksum(&mmap, table, &e)?;
             let seg = read_table_segment_from_bytes(&mmap[off..end], schema)?;
             for i in 0..seg.ts_ms.len() {
                 let t = seg.ts_ms[i];
@@ -450,6 +466,7 @@ impl Storage {
                     "table index range out of bounds",
                 ));
             }
+            verify_table_segment_checksum(&mmap, table, &e)?;
             let seg = read_table_segment_from_bytes(&mmap[off..end], &schema)?;
 
             for i in 0..seg.ts_ms.len() {
@@ -869,6 +886,69 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
         ts_ms,
         cols,
     })
+}
+
+fn verify_table_segment_checksum(
+    mmap: &[u8],
+    table: &str,
+    entry: &TableIndexEntry,
+) -> io::Result<()> {
+    let name_len = table.as_bytes().len() as u64;
+    let payload_len_expected = 2u64
+        .saturating_add(name_len)
+        .saturating_add(entry.len);
+    let payload_offset = entry
+        .offset
+        .checked_sub(2u64.saturating_add(name_len))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "table payload offset underflow"))?;
+    let record_offset = payload_offset
+        .checked_sub(5)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record offset underflow"))?;
+    let end = record_offset
+        .saturating_add(5)
+        .saturating_add(payload_len_expected)
+        .saturating_add(4);
+    if end as usize > mmap.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record checksum out of bounds",
+        ));
+    }
+    let record_type = mmap[record_offset as usize];
+    if record_type != dbfile::RECORD_TABLE_SEGMENT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record type mismatch for table segment",
+        ));
+    }
+    let len_bytes: [u8; 4] = mmap[(record_offset + 1) as usize..(record_offset + 5) as usize]
+        .try_into()
+        .unwrap();
+    let payload_len = u32::from_le_bytes(len_bytes) as u64;
+    if payload_len != payload_len_expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record payload length mismatch",
+        ));
+    }
+    let payload_start = payload_offset as usize;
+    let payload_end = payload_start + payload_len_expected as usize;
+    let mut verify = Vec::with_capacity(1 + 4 + payload_len_expected as usize);
+    verify.push(record_type);
+    verify.extend_from_slice(&(payload_len as u32).to_le_bytes());
+    verify.extend_from_slice(&mmap[payload_start..payload_end]);
+    let checksum_offset = payload_end;
+    let checksum_bytes: [u8; 4] = mmap[checksum_offset..checksum_offset + 4]
+        .try_into()
+        .unwrap();
+    let checksum = u32::from_le_bytes(checksum_bytes);
+    if dbfile::fnv1a32(&verify) != checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record checksum mismatch",
+        ));
+    }
+    Ok(())
 }
 
 

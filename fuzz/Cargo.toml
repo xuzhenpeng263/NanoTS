@@ -1,0 +1,24 @@
+[package]
+name = "nanots-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nanots = { path = ".." }
+
+[[bin]]
+name = "compressor"
+path = "fuzz_targets/compressor.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dbfile"
+path = "fuzz_targets/dbfile.rs"
+test = false
+doc = false
+
+[package.metadata]
+cargo-fuzz = true

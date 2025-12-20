@@ -81,6 +81,11 @@ impl Wal {
     }
 
     pub fn append(&mut self, record: WalRecord<'_>) -> io::Result<()> {
+        let _ = self.append_with_size(record)?;
+        Ok(())
+    }
+
+    pub fn append_with_size(&mut self, record: WalRecord<'_>) -> io::Result<u64> {
         let mut payload = Vec::with_capacity(64);
         payload.extend_from_slice(WAL_MAGIC);
         payload.push(WAL_VERSION);
@@ -192,8 +197,9 @@ impl Wal {
             }
         }
 
+        let payload_len = payload.len() as u64;
         let _ = dbfile::append_record(&self.db_path, dbfile::RECORD_WAL, &payload)?;
-        Ok(())
+        Ok(5 + payload_len + 4)
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -228,6 +234,21 @@ impl Wal {
             on_record(rec)?;
         }
         Ok(())
+    }
+
+    pub fn bytes_since_checkpoint(&self) -> io::Result<u64> {
+        let mut bytes: u64 = 0;
+        dbfile::iter_records(&self.db_path, |hdr, _| {
+            match hdr.record_type {
+                dbfile::RECORD_WAL_CHECKPOINT => bytes = 0,
+                dbfile::RECORD_WAL => {
+                    bytes = bytes.saturating_add(5 + hdr.payload_len as u64 + 4);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(bytes)
     }
 }
 

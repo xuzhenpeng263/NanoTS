@@ -1794,6 +1794,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "datafusion",
+ "datafusion-expr",
  "memmap2",
  "raw-cpuid",
  "rayon",
