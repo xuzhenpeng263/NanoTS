@@ -51,6 +51,11 @@ schema_capsule, array_capsule = batch.__arrow_c_array__()
 db.append_rows_arrow_capsules("sensor", schema_capsule, array_capsule)
 ```
 
+Notes:
+
+- This path uses a batch append internally (columnar), avoiding per-row Python/Rust overhead.
+- Column names must match the table schema; include all columns in order.
+
 ## Auto maintenance options
 
 ```python
