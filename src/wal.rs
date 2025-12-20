@@ -255,7 +255,7 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
 
     let mut pos = 5usize;
     let record_type = read_exact(payload, &mut pos, 1)?[0];
-    match record_type {
+    let record = match record_type {
         RECORD_APPEND => {
             let seq = u64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
             let series_len =
@@ -376,5 +376,13 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             io::ErrorKind::InvalidData,
             "unknown WAL record",
         )),
+    }?;
+
+    if pos != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in WAL payload",
+        ));
     }
+    Ok(record)
 }

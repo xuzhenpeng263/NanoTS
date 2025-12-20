@@ -452,11 +452,6 @@ impl Storage {
             }
             let seg = read_table_segment_from_bytes(&mmap[off..end], &schema)?;
 
-            if acc_ts.is_empty() {
-                acc_min_seq = seg.min_seq;
-            }
-            acc_max_seq = seg.max_seq;
-
             for i in 0..seg.ts_ms.len() {
                 let t = seg.ts_ms[i];
                 if let Some(cut) = cutoff_ms {
@@ -464,6 +459,10 @@ impl Storage {
                         continue;
                     }
                 }
+                if acc_ts.is_empty() {
+                    acc_min_seq = seg.min_seq;
+                }
+                acc_max_seq = seg.max_seq;
                 acc_ts.push(t);
                 for (cidx, col) in seg.cols.iter().enumerate() {
                     match (&mut acc_cols[cidx], col) {

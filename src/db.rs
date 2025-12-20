@@ -286,6 +286,11 @@ fn parse_sql_value_rows(values: &str) -> io::Result<Vec<Vec<Value>>> {
             _ => {
                 if depth > 0 {
                     buf.push(ch);
+                } else if !ch.is_whitespace() && ch != ';' {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unexpected token outside values list",
+                    ));
                 }
             }
         }
@@ -648,11 +653,11 @@ impl NanoTsDb {
         }
 
         self.wal.flush()?;
-        self.wal.reset()?;
         self.storage.write_meta(self.meta.last_seq, self.meta.retention_ms)?;
         for t in self.tables.keys() {
             self.storage.write_table_index(t)?;
         }
+        self.wal.reset()?;
         Ok(())
     }
 

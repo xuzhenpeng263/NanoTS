@@ -15,6 +15,8 @@ pub const RECORD_WAL_CHECKPOINT: u8 = 5;
 pub const RECORD_SERIES_SEGMENT: u8 = 6;
 pub const RECORD_TABLE_INDEX: u8 = 7;
 
+const MAX_RECORD_SIZE: u32 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RecordHeader {
     pub record_type: u8,
@@ -143,6 +145,12 @@ where
         }
         let record_type = head[0];
         let payload_len = u32::from_le_bytes(head[1..5].try_into().unwrap());
+        if payload_len > MAX_RECORD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record payload too large",
+            ));
+        }
         let payload_offset = offset + 5;
         offset += 5;
         let remaining = file_len.saturating_sub(offset);
