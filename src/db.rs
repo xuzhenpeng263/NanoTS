@@ -342,6 +342,34 @@ fn parse_sql_ident(ident: &str) -> io::Result<String> {
     if ident.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty identifier"));
     }
+    let bytes = ident.as_bytes();
+    if (bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"'))
+        || (bytes.first() == Some(&b'`') && bytes.last() == Some(&b'`'))
+    {
+        let quote = bytes[0] as char;
+        let inner = &ident[1..ident.len() - 1];
+        let mut out = String::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == quote {
+                if chars.peek() == Some(&quote) {
+                    out.push(quote);
+                    chars.next();
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid identifier",
+                    ));
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        if out.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty identifier"));
+        }
+        return Ok(out);
+    }
     if !ident
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')

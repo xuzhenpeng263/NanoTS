@@ -3,6 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const FILE_MAGIC: &[u8; 4] = b"NTSF";
 pub const FILE_VERSION: u8 = 1;
@@ -15,7 +16,18 @@ pub const RECORD_WAL_CHECKPOINT: u8 = 5;
 pub const RECORD_SERIES_SEGMENT: u8 = 6;
 pub const RECORD_TABLE_INDEX: u8 = 7;
 
-const MAX_RECORD_SIZE: u32 = 64 * 1024 * 1024;
+const DEFAULT_MAX_RECORD_SIZE: u32 = 64 * 1024 * 1024;
+
+fn max_record_size() -> u32 {
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NANOTS_MAX_RECORD_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_RECORD_SIZE)
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RecordHeader {
@@ -145,7 +157,7 @@ where
         }
         let record_type = head[0];
         let payload_len = u32::from_le_bytes(head[1..5].try_into().unwrap());
-        if payload_len > MAX_RECORD_SIZE {
+        if payload_len > max_record_size() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "record payload too large",
