@@ -1558,15 +1558,27 @@ fn entry_may_match_predicates(entry: &TableIndexEntry, preds: &[MappedPredicate]
             (ColumnStats::Bool { min, max }, ColumnPredicateValue::Bool(v)) => {
                 bool_range_may_match(*min, *max, *v, pred.op)
             }
-            (ColumnStats::Utf8 { distinct, .. }, ColumnPredicateValue::Utf8(v)) => {
-                match pred.op {
-                    ColumnPredicateOp::Eq => distinct
-                        .as_ref()
-                        .map(|vals| vals.iter().any(|s| s == v))
-                        .unwrap_or(true),
-                    _ => true,
+            (
+                ColumnStats::Utf8 {
+                    min_len,
+                    max_len,
+                    distinct,
+                },
+                ColumnPredicateValue::Utf8(v),
+            ) => match pred.op {
+                ColumnPredicateOp::Eq => {
+                    let len = v.len() as u32;
+                    if len < *min_len || len > *max_len {
+                        false
+                    } else {
+                        distinct
+                            .as_ref()
+                            .map(|vals| vals.iter().any(|s| s == v))
+                            .unwrap_or(true)
+                    }
                 }
-            }
+                _ => true,
+            },
             _ => true,
         };
         if !ok {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use crate::db::{ColumnData, NanoTsDb, NanoTsOptions, Point};
+use crate::db::{ColumnData, ColumnType, NanoTsDb, NanoTsOptions, Point, TableSchema};
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_longlong};
 use std::ptr;
@@ -28,6 +29,112 @@ fn cstr_to_string(s: *const c_char) -> Result<String, c_int> {
         .to_str()
         .map(|s| s.to_string())
         .map_err(|_| -3)
+}
+
+#[cfg(feature = "arrow")]
+const ARROW_FLAG_NULLABLE: i64 = 1;
+
+#[cfg(feature = "arrow")]
+fn arrow_format_to_col_type(format: &str) -> Option<ColumnType> {
+    match format {
+        "g" => Some(ColumnType::F64),
+        "l" => Some(ColumnType::I64),
+        "b" => Some(ColumnType::Bool),
+        "u" => Some(ColumnType::Utf8),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn validate_arrow_schema(
+    table_schema: &TableSchema,
+    schema: *mut ArrowSchema,
+    array: *mut ArrowArray,
+) -> Result<(), c_int> {
+    if schema.is_null() || array.is_null() {
+        return Err(-2);
+    }
+    let schema_ref = unsafe { &*schema };
+    let array_ref = unsafe { &*array };
+    let format = cstr_to_string(schema_ref.format)?;
+    if format != "+s" {
+        return Err(-2);
+    }
+    if schema_ref.n_children < 0 || array_ref.n_children < 0 {
+        return Err(-2);
+    }
+    if schema_ref.n_children != array_ref.n_children {
+        return Err(-2);
+    }
+    let n_children = schema_ref.n_children as usize;
+    if n_children == 0 {
+        return Err(-2);
+    }
+    if schema_ref.children.is_null() || array_ref.children.is_null() {
+        return Err(-2);
+    }
+    let schema_children =
+        unsafe { std::slice::from_raw_parts(schema_ref.children, n_children) };
+    let array_children = unsafe { std::slice::from_raw_parts(array_ref.children, n_children) };
+
+    let expected: Vec<(String, ColumnType)> = table_schema
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.col_type))
+        .collect();
+    let mut seen_cols: HashSet<String> = HashSet::new();
+    let mut seen_ts = false;
+
+    for (child_schema_ptr, child_array_ptr) in
+        schema_children.iter().zip(array_children.iter())
+    {
+        if child_schema_ptr.is_null() || child_array_ptr.is_null() {
+            return Err(-2);
+        }
+        let child_schema = unsafe { &**child_schema_ptr };
+        let child_array = unsafe { &**child_array_ptr };
+        let name = cstr_to_string(child_schema.name)?;
+        let child_format = cstr_to_string(child_schema.format)?;
+        if name == "ts" || name == "ts_ms" {
+            if child_format != "l" {
+                return Err(-2);
+            }
+            if seen_ts {
+                return Err(-2);
+            }
+            if child_array.null_count != 0 {
+                return Err(-2);
+            }
+            seen_ts = true;
+            continue;
+        }
+
+        let col_type = arrow_format_to_col_type(&child_format).ok_or(-2)?;
+        let mut matched = false;
+        for (col_name, expected_type) in &expected {
+            if *col_name == name {
+                matched = true;
+                if *expected_type != col_type {
+                    return Err(-2);
+                }
+                break;
+            }
+        }
+        if !matched {
+            return Err(-2);
+        }
+        if !seen_cols.insert(name.clone()) {
+            return Err(-2);
+        }
+        if (child_schema.flags & ARROW_FLAG_NULLABLE) == 0 && child_array.null_count != 0 {
+            return Err(-2);
+        }
+    }
+
+    if !seen_ts || seen_cols.len() != expected.len() {
+        return Err(-2);
+    }
+    Ok(())
 }
 
 #[no_mangle]
@@ -230,6 +337,12 @@ pub extern "C" fn nanots_append_rows_arrow(
     let Ok(mut db) = handle.db.lock() else {
         return -4;
     };
+    let Ok(table_schema) = db.table_schema(&table) else {
+        return -1;
+    };
+    if validate_arrow_schema(&table_schema, schema, array).is_err() {
+        return -2;
+    }
     match db.append_table_batch_arrow(&table, schema, array) {
         Ok(rows) => rows as c_longlong,
         Err(_) => -1,

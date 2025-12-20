@@ -145,6 +145,9 @@ pub struct DbDiagnostics {
     pub wal_bytes: u64,
     pub total_table_segment_bytes: u64,
     pub wal_ratio: Option<f64>,
+    pub row_append_count: u64,
+    pub batch_append_count: u64,
+    pub arrow_batch_avg_latency_ms: Option<f64>,
     pub pending_rows: u64,
     pub pending_tables: u64,
     pub writes_per_sec: u64,
@@ -188,6 +191,9 @@ pub struct DbDiagnosticsReport {
     pub wal_bytes: u64,
     pub total_table_segment_bytes: u64,
     pub wal_ratio: Option<f64>,
+    pub row_append_count: u64,
+    pub batch_append_count: u64,
+    pub arrow_batch_avg_latency_ms: Option<f64>,
     pub pending_rows: u64,
     pub pending_tables: u64,
     pub writes_per_sec: u64,
@@ -268,6 +274,56 @@ fn init_column_buffers(schema: &TableSchema, capacity: usize) -> Vec<ColumnData>
             ColumnType::Utf8 => ColumnData::Utf8(Vec::with_capacity(capacity)),
         })
         .collect()
+}
+
+fn validate_table_batch(
+    schema: &TableSchema,
+    ts_ms: &[i64],
+    cols: &[ColumnData],
+) -> io::Result<()> {
+    if cols.len() != schema.columns.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "column length mismatch",
+        ));
+    }
+    for (col, schema_col) in cols.iter().zip(schema.columns.iter()) {
+        let len = match col {
+            ColumnData::F64(v) => v.len(),
+            ColumnData::I64(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::Utf8(v) => v.len(),
+        };
+        if len != ts_ms.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "column length mismatch",
+            ));
+        }
+        let type_ok = matches!(
+            (col, schema_col.col_type),
+            (ColumnData::F64(_), ColumnType::F64)
+                | (ColumnData::I64(_), ColumnType::I64)
+                | (ColumnData::Bool(_), ColumnType::Bool)
+                | (ColumnData::Utf8(_), ColumnType::Utf8)
+        );
+        if !type_ok {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "column type mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn slice_column_data(col: &ColumnData, range: std::ops::Range<usize>) -> ColumnData {
+    match col {
+        ColumnData::F64(values) => ColumnData::F64(values[range].to_vec()),
+        ColumnData::I64(values) => ColumnData::I64(values[range].to_vec()),
+        ColumnData::Bool(values) => ColumnData::Bool(values[range].to_vec()),
+        ColumnData::Utf8(values) => ColumnData::Utf8(values[range].to_vec()),
+    }
 }
 
 fn map_predicates_for_schema(
@@ -602,6 +658,10 @@ pub struct NanoTsDb {
     meta: Meta,
     next_seq: u64,
     wal_bytes: u64,
+    row_append_count: u64,
+    batch_append_count: u64,
+    arrow_batch_count: u64,
+    arrow_batch_total_nanos: u128,
     options: NanoTsOptions,
     tables: HashMap<String, TableBuffer>,
     write_stats: WriteStats,
@@ -692,6 +752,10 @@ impl NanoTsDb {
             meta,
             next_seq: 1,
             wal_bytes,
+            row_append_count: 0,
+            batch_append_count: 0,
+            arrow_batch_count: 0,
+            arrow_batch_total_nanos: 0,
             options,
             tables: HashMap::new(),
             write_stats: WriteStats {
@@ -810,6 +874,80 @@ impl NanoTsDb {
         self.write_stats.last_write = Instant::now();
     }
 
+    fn target_segment_points(&self) -> usize {
+        self.options
+            .auto_maintenance
+            .as_ref()
+            .map(|opts| opts.target_segment_points)
+            .unwrap_or(self.options.block_points.max(1))
+    }
+
+    fn append_batch_to_buffer(
+        &mut self,
+        table: &str,
+        seq_start: u64,
+        ts_ms: &[i64],
+        cols: &[ColumnData],
+    ) -> io::Result<()> {
+        let Some(buf) = self.tables.get_mut(table) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "table not found"));
+        };
+        let mut values: Vec<Value> = vec![Value::Null; buf.schema.columns.len()];
+        for (row, ts) in ts_ms.iter().enumerate() {
+            for (cidx, col) in cols.iter().enumerate() {
+                values[cidx] = match col {
+                    ColumnData::F64(v) => v[row].map(Value::F64).unwrap_or(Value::Null),
+                    ColumnData::I64(v) => v[row].map(Value::I64).unwrap_or(Value::Null),
+                    ColumnData::Bool(v) => v[row].map(Value::Bool).unwrap_or(Value::Null),
+                    ColumnData::Utf8(v) => v[row]
+                        .as_ref()
+                        .map(|s| Value::Utf8(s.clone()))
+                        .unwrap_or(Value::Null),
+                };
+            }
+            buf.rows.push(PendingRow {
+                seq: seq_start.saturating_add(row as u64),
+                ts_ms: *ts,
+                values: values.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn append_batch_as_segments(
+        &mut self,
+        table: &str,
+        schema: &TableSchema,
+        seq_start: u64,
+        ts_ms: &[i64],
+        cols: &[ColumnData],
+        target_segment_points: usize,
+    ) -> io::Result<()> {
+        let mut start = 0usize;
+        let chunk_size = target_segment_points.max(1);
+        while start < ts_ms.len() {
+            let end = (start + chunk_size).min(ts_ms.len());
+            let chunk_ts = &ts_ms[start..end];
+            let mut chunk_cols = Vec::with_capacity(cols.len());
+            for col in cols {
+                chunk_cols.push(slice_column_data(col, start..end));
+            }
+            let chunk_seq_start = seq_start.saturating_add(start as u64);
+            let chunk_seq_end = seq_start.saturating_add(end as u64).saturating_sub(1);
+            self.storage.append_table_segment(
+                table,
+                schema,
+                chunk_ts,
+                &chunk_cols,
+                chunk_seq_start,
+                chunk_seq_end,
+            )?;
+            self.meta.last_seq = self.meta.last_seq.max(chunk_seq_end);
+            start = end;
+        }
+        Ok(())
+    }
+
     pub fn append_row(&mut self, table: &str, ts_ms: i64, values: &[f64]) -> io::Result<u64> {
         if !self.tables.contains_key(table) && !self.storage.table_exists(table) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "table not found"));
@@ -873,58 +1011,40 @@ impl NanoTsDb {
             );
         }
         let schema = self.tables.get(table).unwrap().schema.clone();
-        if cols.len() != schema.columns.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "column length mismatch",
-            ));
-        }
-        for (col, schema_col) in cols.iter().zip(schema.columns.iter()) {
-            let len = match col {
-                ColumnData::F64(v) => v.len(),
-                ColumnData::I64(v) => v.len(),
-                ColumnData::Bool(v) => v.len(),
-                ColumnData::Utf8(v) => v.len(),
-            };
-            if len != ts_ms.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "column length mismatch",
-                ));
-            }
-            let type_ok = matches!(
-                (col, schema_col.col_type),
-                (ColumnData::F64(_), ColumnType::F64)
-                    | (ColumnData::I64(_), ColumnType::I64)
-                    | (ColumnData::Bool(_), ColumnType::Bool)
-                    | (ColumnData::Utf8(_), ColumnType::Utf8)
-            );
-            if !type_ok {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "column type mismatch",
-                ));
-            }
+        validate_table_batch(&schema, ts_ms, cols)?;
+
+        self.record_write();
+        self.batch_append_count = self.batch_append_count.saturating_add(1);
+
+        let row_count = ts_ms.len();
+        let seq_start = self.next_seq;
+        let seq_end = seq_start.saturating_add(row_count as u64).saturating_sub(1);
+        self.next_seq = seq_end.saturating_add(1);
+
+        let wal_bytes = self.wal.append_with_size(WalRecord::AppendBatch {
+            seq_start,
+            table,
+            ts_ms,
+            cols,
+        })?;
+        self.wal_bytes = self.wal_bytes.saturating_add(wal_bytes);
+
+        let target_segment_points = self.target_segment_points();
+        if row_count >= target_segment_points {
+            self.append_batch_as_segments(table, &schema, seq_start, ts_ms, cols, target_segment_points)?;
+            return Ok(row_count as u64);
         }
 
-        let mut values: Vec<Value> = vec![Value::Null; schema.columns.len()];
-        let mut appended = 0u64;
-        for row in 0..ts_ms.len() {
-            for (cidx, col) in cols.iter().enumerate() {
-                values[cidx] = match col {
-                    ColumnData::F64(v) => v[row].map(Value::F64).unwrap_or(Value::Null),
-                    ColumnData::I64(v) => v[row].map(Value::I64).unwrap_or(Value::Null),
-                    ColumnData::Bool(v) => v[row].map(Value::Bool).unwrap_or(Value::Null),
-                    ColumnData::Utf8(v) => v[row]
-                        .as_ref()
-                        .map(|s| Value::Utf8(s.clone()))
-                        .unwrap_or(Value::Null),
-                };
-            }
-            self.append_row_values(table, ts_ms[row], &values)?;
-            appended = appended.saturating_add(1);
+        self.append_batch_to_buffer(table, seq_start, ts_ms, cols)?;
+        let needs_flush = self
+            .tables
+            .get(table)
+            .map(|buf| buf.rows.len() >= self.options.block_points)
+            .unwrap_or(false);
+        if needs_flush {
+            self.flush_table(table)?;
         }
-        Ok(appended)
+        Ok(row_count as u64)
     }
 
     #[cfg(feature = "arrow")]
@@ -934,6 +1054,7 @@ impl NanoTsDb {
         schema: *mut crate::arrow::ArrowSchema,
         array: *mut crate::arrow::ArrowArray,
     ) -> io::Result<u64> {
+        let started = Instant::now();
         let batch = crate::arrow::import_ts_table_from_c(schema, array).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("arrow import failed: {}", e))
         })?;
@@ -951,7 +1072,11 @@ impl NanoTsDb {
                 })?;
             cols.push(data);
         }
-        self.append_table_batch(table, &batch.ts_ms, &cols)
+        let appended = self.append_table_batch(table, &batch.ts_ms, &cols)?;
+        let elapsed = started.elapsed().as_nanos();
+        self.arrow_batch_count = self.arrow_batch_count.saturating_add(1);
+        self.arrow_batch_total_nanos = self.arrow_batch_total_nanos.saturating_add(elapsed);
+        Ok(appended)
     }
 
     fn append_row_values(
@@ -977,6 +1102,7 @@ impl NanoTsDb {
         }
 
         self.record_write();
+        self.row_append_count = self.row_append_count.saturating_add(1);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
 
@@ -1406,10 +1532,20 @@ impl NanoTsDb {
             .elapsed()
             .as_millis()
             .min(u64::MAX as u128) as u64;
+        let arrow_batch_avg_latency_ms = if self.arrow_batch_count > 0 {
+            Some(
+                (self.arrow_batch_total_nanos as f64 / self.arrow_batch_count as f64) / 1_000_000.0,
+            )
+        } else {
+            None
+        };
         Ok(DbDiagnostics {
             wal_bytes: self.wal_bytes,
             total_table_segment_bytes,
             wal_ratio,
+            row_append_count: self.row_append_count,
+            batch_append_count: self.batch_append_count,
+            arrow_batch_avg_latency_ms,
             pending_rows,
             pending_tables,
             writes_per_sec,
@@ -1481,6 +1617,9 @@ impl NanoTsDb {
             wal_bytes: base.wal_bytes,
             total_table_segment_bytes: base.total_table_segment_bytes,
             wal_ratio: base.wal_ratio,
+            row_append_count: base.row_append_count,
+            batch_append_count: base.batch_append_count,
+            arrow_batch_avg_latency_ms: base.arrow_batch_avg_latency_ms,
             pending_rows: base.pending_rows,
             pending_tables: base.pending_tables,
             writes_per_sec: base.writes_per_sec,
@@ -1667,6 +1806,54 @@ impl NanoTsDb {
                         ts_ms,
                         values,
                     });
+                }
+                WalRecordOwned::AppendBatch {
+                    seq_start,
+                    table,
+                    ts_ms,
+                    cols,
+                } => {
+                    let total_rows = ts_ms.len();
+                    if total_rows == 0 {
+                        continue;
+                    }
+                    let seq_end = seq_start.saturating_add(total_rows as u64).saturating_sub(1);
+                    if seq_end <= last {
+                        continue;
+                    }
+                    let start_idx = if last >= seq_start {
+                        (last - seq_start + 1) as usize
+                    } else {
+                        0
+                    };
+                    if start_idx >= total_rows {
+                        continue;
+                    }
+                    if !self.tables.contains_key(&table) && !self.storage.table_exists(&table) {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "table not found"));
+                    }
+                    if !self.tables.contains_key(&table) {
+                        let schema = self.storage.read_table_schema(&table)?;
+                        self.tables.insert(
+                            table.to_string(),
+                            TableBuffer {
+                                schema,
+                                rows: Vec::new(),
+                            },
+                        );
+                    }
+                    let schema = self.tables.get(&table).unwrap().schema.clone();
+                    let ts_slice = &ts_ms[start_idx..];
+                    let mut cols_slice = Vec::with_capacity(cols.len());
+                    for col in &cols {
+                        cols_slice.push(slice_column_data(col, start_idx..total_rows));
+                    }
+                    validate_table_batch(&schema, ts_slice, &cols_slice)?;
+                    let seq_start_effective = seq_start.saturating_add(start_idx as u64);
+                    self.append_batch_to_buffer(&table, seq_start_effective, ts_slice, &cols_slice)?;
+                    let applied_end =
+                        seq_start_effective.saturating_add(ts_slice.len() as u64).saturating_sub(1);
+                    max_seen = max_seen.max(applied_end);
                 }
             }
         }
@@ -2001,6 +2188,8 @@ mod tests {
 
         let diag = db.get_diagnostics().unwrap();
         assert_eq!(diag.tables.len(), 1);
+        assert_eq!(diag.row_append_count, 2);
+        assert_eq!(diag.batch_append_count, 0);
         let table = &diag.tables[0];
         assert_eq!(table.table, "metrics");
         assert_eq!(table.columns.len(), 3);
@@ -2116,6 +2305,50 @@ mod tests {
             assert_eq!(ts[1], 1001);
             assert_eq!(cols[0][0], 1.0);
             assert_eq!(cols[0][1], 2.0);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_wal_replay_batch_append() {
+        let path = fresh_db_path("wal_replay_batch");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table_typed(
+                "t",
+                &[
+                    ("temp", ColumnType::F64),
+                    ("flag", ColumnType::Bool),
+                    ("tag", ColumnType::Utf8),
+                ],
+            )
+            .unwrap();
+            let ts = vec![1000, 1001, 1002];
+            let cols = vec![
+                ColumnData::F64(vec![Some(1.0), None, Some(3.0)]),
+                ColumnData::Bool(vec![Some(true), Some(false), None]),
+                ColumnData::Utf8(vec![
+                    Some("a".to_string()),
+                    None,
+                    Some("c".to_string()),
+                ]),
+            ];
+            db.append_table_batch("t", &ts, &cols).unwrap();
+            // Drop without flush to force WAL replay.
+        }
+        {
+            let db = NanoTsDb::open(&path, opts).unwrap();
+            let (ts, cols) = db.query_table_range_typed("t", 0, 10_000).unwrap();
+            assert_eq!(ts, vec![1000, 1001, 1002]);
+            match &cols[0] {
+                ColumnData::F64(values) => assert_eq!(values[1], None),
+                _ => panic!("unexpected column type"),
+            }
+            match &cols[2] {
+                ColumnData::Utf8(values) => assert_eq!(values[2].as_deref(), Some("c")),
+                _ => panic!("unexpected column type"),
+            }
         }
         let _ = fs::remove_file(path);
     }
