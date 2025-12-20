@@ -5,6 +5,7 @@ use nanots_core::db::{AutoMaintenanceOptions, ColumnData, ColumnType, Value};
 use nanots_core::{NanoTsDb, NanoTsOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::BoundObject;
 use pyo3::types::{PyAny, PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyString};
 #[cfg(feature = "arrow")]
 use pyo3::types::PyCapsule;
@@ -574,9 +575,14 @@ impl Db {
 fn option_to_pyobject<'py, T>(py: Python<'py>, value: Option<T>) -> PyResult<PyObject>
 where
     T: IntoPyObject<'py>,
+    <T as IntoPyObject<'py>>::Error: Into<PyErr>,
 {
     match value {
-        Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        Some(v) => Ok(v
+            .into_pyobject(py)
+            .map_err(Into::into)?
+            .into_any()
+            .unbind()),
         None => Ok(py.None()),
     }
 }

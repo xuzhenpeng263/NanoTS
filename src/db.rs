@@ -1245,23 +1245,19 @@ impl NanoTsDb {
         end_ms: i64,
         predicates: &[ColumnPredicate],
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
-        let effective_start = match self.retention_cutoff_ms() {
-            Some(cutoff) => start_ms.max(cutoff),
-            None => start_ms,
-        };
         let schema = self.storage.read_table_schema(table)?;
         let mapped_predicates = map_predicates_for_schema(&schema, predicates);
         let mut out = self.storage.read_table_columns_in_range_filtered(
             table,
             &schema,
-            effective_start,
+            start_ms,
             end_ms,
             predicates,
         )?;
 
         if let Some(buf) = self.tables.get(table) {
             for r in &buf.rows {
-                if r.ts_ms < effective_start || r.ts_ms > end_ms {
+                if r.ts_ms < start_ms || r.ts_ms > end_ms {
                     continue;
                 }
                 if !mapped_predicates.is_empty() && !row_matches_predicates(&r.values, &mapped_predicates)
@@ -1330,16 +1326,12 @@ impl NanoTsDb {
         end_ms: i64,
         predicates: &[ColumnPredicate],
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
-        let effective_start = match self.retention_cutoff_ms() {
-            Some(cutoff) => start_ms.max(cutoff),
-            None => start_ms,
-        };
         let schema = self.storage.read_table_schema(table)?;
         let snapshot_end = self.storage.file_len()?;
         self.storage.read_table_columns_in_range_filtered_with_limit(
             table,
             &schema,
-            effective_start,
+            start_ms,
             end_ms,
             predicates,
             Some(snapshot_end),
@@ -1355,26 +1347,17 @@ impl NanoTsDb {
         predicates: &[ColumnPredicate],
         partitions: usize,
     ) -> io::Result<Vec<(Vec<i64>, Vec<ColumnData>)>> {
-        let effective_start = match self.retention_cutoff_ms() {
-            Some(cutoff) => start_ms.max(cutoff),
-            None => start_ms,
-        };
         let schema = self.storage.read_table_schema(table)?;
         let snapshot_end = self.storage.file_len()?;
         self.storage.read_table_columns_in_range_filtered_partitions_with_limit(
             table,
             &schema,
-            effective_start,
+            start_ms,
             end_ms,
             predicates,
             Some(snapshot_end),
             partitions,
         )
-    }
-
-    fn retention_cutoff_ms(&self) -> Option<i64> {
-        let retention_ms = self.meta.retention_ms?;
-        Some(now_ms().saturating_sub(retention_ms))
     }
 
     fn execute_create_table(&mut self, sql: &str) -> io::Result<()> {
