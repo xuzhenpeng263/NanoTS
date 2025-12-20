@@ -12,6 +12,53 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Platform-specific memory access optimization hint for sequential access
+fn advise_sequential_access(_mmap: &memmap2::Mmap) {
+    #[cfg(unix)]
+    {
+        let _ = _mmap.advise(memmap2::Advice::Sequential);
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, prefetch is handled when we open the file with FILE_FLAG_SEQUENTIAL_SCAN
+        // The memory manager will automatically optimize for sequential access
+    }
+}
+
+/// Platform-specific memory access optimization hint for will-need
+fn advise_will_need(_mmap: &memmap2::Mmap) {
+    #[cfg(unix)]
+    {
+        let _ = _mmap.advise(memmap2::Advice::WillNeed);
+    }
+    #[cfg(windows)]
+    {
+        // Windows 8+ supports PrefetchVirtualMemory
+        // For now, we rely on Windows' automatic read-ahead
+        // Could be enhanced with explicit PrefetchVirtualMemory if needed
+    }
+}
+
+/// Platform-specific file opening for optimized I/O
+#[cfg(unix)]
+fn open_file_for_sequential_access(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn open_file_for_sequential_access(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Windows-specific flag for sequential access optimization
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(path)
+}
+
 const SEG_MAGIC: &[u8; 4] = b"NTSG";
 const SEG_VERSION: u8 = 1;
 const TS_CODEC_TS64: u8 = 1;
@@ -464,10 +511,9 @@ impl Storage {
             .collect();
             return Ok((Vec::new(), cols));
         }
-        let file = File::open(&self.path)?;
+        let file = open_file_for_sequential_access(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::Sequential);
+        advise_sequential_access(&mmap);
         let mapped_predicates = map_predicates(schema, predicates);
         let entries = filter_index_entries(index, max_offset);
         read_table_columns_from_entries(
@@ -505,10 +551,9 @@ impl Storage {
                 .collect();
             return Ok(vec![(Vec::new(), cols)]);
         }
-        let file = File::open(&self.path)?;
+        let file = open_file_for_sequential_access(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::WillNeed);
+        advise_will_need(&mmap);
 
         let mapped_predicates = map_predicates(schema, predicates);
         let entries = filter_index_entries(index, max_offset);
@@ -564,7 +609,7 @@ impl Storage {
         if index.is_empty() {
             return Ok(());
         }
-        let file = File::open(&self.path)?;
+        let file = open_file_for_sequential_access(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -705,7 +750,7 @@ impl Storage {
         if index.is_empty() {
             return Ok(());
         }
-        let file = File::open(&self.path)?;
+        let file = open_file_for_sequential_access(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -886,7 +931,7 @@ impl Storage {
             });
         }
 
-        let file = File::open(&self.path)?;
+        let file = open_file_for_sequential_access(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         let mut rows: u64 = 0;
         let mut segments: u64 = 0;
@@ -945,7 +990,7 @@ impl Storage {
         if index.is_empty() {
             return Ok(out);
         }
-        let file = File::open(&self.path)?;
+        let file = open_file_for_sequential_access(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         for e in index {
             let off = e.offset as usize;
