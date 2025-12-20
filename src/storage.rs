@@ -4,7 +4,7 @@ use crate::compressor::TimeSeriesCompressor;
 use crate::compressor::{compress_f64_xor, decompress_f64_xor};
 use crate::db::{ColumnData, ColumnPredicate, ColumnPredicateOp, ColumnPredicateValue, ColumnSchema, ColumnType, Point, TableSchema};
 use crate::dbfile;
-use memmap2::{Advice, MmapOptions};
+use memmap2::MmapOptions;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
@@ -466,7 +466,8 @@ impl Storage {
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let _ = mmap.advise(Advice::Sequential);
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         let mapped_predicates = map_predicates(schema, predicates);
         let entries = filter_index_entries(index, max_offset);
         read_table_columns_from_entries(
@@ -506,7 +507,8 @@ impl Storage {
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let _ = mmap.advise(Advice::WillNeed);
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::WillNeed);
 
         let mapped_predicates = map_predicates(schema, predicates);
         let entries = filter_index_entries(index, max_offset);
@@ -564,7 +566,8 @@ impl Storage {
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let _ = mmap.advise(Advice::Sequential);
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         let tmp = rewrite_db_without_table(&self.path, table)?;
 
         let mut acc_ts: Vec<i64> = Vec::new();
@@ -704,7 +707,8 @@ impl Storage {
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let _ = mmap.advise(Advice::Sequential);
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
 
         let mut acc_ts: Vec<i64> = Vec::new();
         let mut acc_cols: Vec<ColumnData> = schema
