@@ -1970,6 +1970,7 @@ impl NanoTsDb {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn pack_all_tables(&mut self, target_segment_points: usize) -> io::Result<()> {
         self.flush()?;
         for table in self.storage.list_tables()? {

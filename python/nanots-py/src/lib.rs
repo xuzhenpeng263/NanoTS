@@ -8,14 +8,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyString};
 #[cfg(feature = "arrow")]
 use pyo3::types::PyCapsule;
-#[cfg(feature = "datafusion")]
-use pyo3_asyncio::tokio::future_into_py;
 use std::sync::Mutex;
 use std::time::Duration;
 #[cfg(feature = "arrow")]
 use std::ffi::c_void;
 #[cfg(feature = "datafusion")]
-use tokio::task;
+use std::thread;
 
 #[cfg(feature = "arrow")]
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, StructArray};
@@ -133,26 +131,26 @@ impl Db {
                 ColumnData::F64(values) => out_cols.push(
                     values
                         .into_iter()
-                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
-                        .collect(),
+                        .map(|v| option_to_pyobject(py, v))
+                        .collect::<PyResult<Vec<_>>>()?,
                 ),
                 ColumnData::I64(values) => out_cols.push(
                     values
                         .into_iter()
-                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
-                        .collect(),
+                        .map(|v| option_to_pyobject(py, v))
+                        .collect::<PyResult<Vec<_>>>()?,
                 ),
                 ColumnData::Bool(values) => out_cols.push(
                     values
                         .into_iter()
-                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
-                        .collect(),
+                        .map(|v| option_to_pyobject(py, v))
+                        .collect::<PyResult<Vec<_>>>()?,
                 ),
                 ColumnData::Utf8(values) => out_cols.push(
                     values
                         .into_iter()
-                        .map(|v| v.map(|x| x.to_object(py)).unwrap_or_else(|| py.None()))
-                        .collect(),
+                        .map(|v| option_to_pyobject(py, v))
+                        .collect::<PyResult<Vec<_>>>()?,
                 ),
             }
         }
@@ -369,9 +367,15 @@ impl Db {
     }
 
     #[cfg(feature = "datafusion")]
-    fn query_sql_async<'p>(&self, py: Python<'p>, sql: &str) -> PyResult<&'p PyAny> {
+    fn query_sql_async(&self, py: Python<'_>, sql: &str) -> PyResult<Py<PyAny>> {
         let path = self.path.clone();
         let sql = sql.to_string();
+        let loop_obj: Py<PyAny> = py
+            .import("asyncio")?
+            .call_method0("get_running_loop")?
+            .unbind();
+        let future: Py<PyAny> = loop_obj.bind(py).call_method0("create_future")?.unbind();
+
         {
             let mut db = self
                 .inner
@@ -380,19 +384,42 @@ impl Db {
             db.flush()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
-        future_into_py(py, async move {
-            let batches = task::spawn_blocking(move || {
+
+        let loop_handle = loop_obj.clone_ref(py);
+        let future_handle = future.clone_ref(py);
+        thread::spawn(move || {
+            let result = (|| -> PyResult<PyObject> {
                 let db = std::sync::Arc::new(
                     NanoTsDb::open(&path, NanoTsOptions::default())
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
                 );
-                nanots_core::datafusion::query_sql(db, &sql)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                let batches = nanots_core::datafusion::query_sql(db, &sql)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Python::with_gil(|py| build_arrow_stream_capsule(py, batches))
+            })();
+            Python::with_gil(|py| {
+                let loop_obj = loop_handle.bind(py);
+                let future_obj = future_handle.bind(py);
+                match result {
+                    Ok(val) => {
+                        let _ = loop_obj.call_method1(
+                            "call_soon_threadsafe",
+                            (future_obj.getattr("set_result")?, val),
+                        );
+                    }
+                    Err(err) => {
+                        let err_obj = err.value(py).clone().into_any().unbind();
+                        let _ = loop_obj.call_method1(
+                            "call_soon_threadsafe",
+                            (future_obj.getattr("set_exception")?, err_obj),
+                        );
+                    }
+                }
+                Ok::<(), PyErr>(())
             })
-            .await
-            .map_err(|e| PyRuntimeError::new_err(format!("sql task failed: {e}")))??;
-            Python::with_gil(|py| build_arrow_stream_capsule(py, batches))
-        })
+            .ok();
+        });
+        Ok(future)
     }
 
     #[cfg(feature = "datafusion")]
@@ -477,7 +504,7 @@ impl Db {
             }
         }
 
-        Ok(d.to_object(py))
+        Ok(d.into_any().unbind())
     }
 
     fn diagnose(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -500,7 +527,7 @@ impl Db {
         d.set_item("pending_tables", diag.pending_tables)?;
         d.set_item("writes_per_sec", diag.writes_per_sec)?;
         d.set_item("last_write_age_ms", diag.last_write_age_ms)?;
-        Ok(d.to_object(py))
+        Ok(d.into_any().unbind())
     }
 
     fn table_time_range(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
@@ -512,7 +539,10 @@ impl Db {
             .table_time_range(table)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match range {
-            Some((min_ts, max_ts)) => Ok((min_ts, max_ts).to_object(py)),
+            Some((min_ts, max_ts)) => Ok((min_ts, max_ts)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
             None => Ok(py.None()),
         }
     }
@@ -538,6 +568,16 @@ impl Db {
         );
         nanots_core::datafusion::query_sql(db, sql)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+fn option_to_pyobject<'py, T>(py: Python<'py>, value: Option<T>) -> PyResult<PyObject>
+where
+    T: IntoPyObject<'py>,
+{
+    match value {
+        Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        None => Ok(py.None()),
     }
 }
 

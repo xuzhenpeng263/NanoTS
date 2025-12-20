@@ -11,8 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 nanots-core = { package = "nanots", path = "../..", default-features = false }
 pyo3 = { version = "0.23", features = ["extension-module"] }
-pyo3-asyncio = { version = "0.23", features = ["tokio-runtime"] }
-tokio = { version = "1", features = ["rt", "macros"] }
 datafusion = { version = "43", optional = true }
 arrow = { version = "53.4.1", features = ["ffi"], optional = true }
 
