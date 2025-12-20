@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, RwLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,6 +39,8 @@ pub struct AutoMaintenanceOptions {
     pub wal_target_ratio: u64,
     pub wal_min_bytes: u64,
     pub target_segment_points: usize,
+    pub max_writes_per_sec: u64,
+    pub write_load_window: Duration,
 }
 
 impl Default for AutoMaintenanceOptions {
@@ -49,6 +51,8 @@ impl Default for AutoMaintenanceOptions {
             wal_target_ratio: 2,
             wal_min_bytes: 32 * 1024 * 1024,
             target_segment_points: 8192,
+            max_writes_per_sec: 100_000,
+            write_load_window: Duration::from_secs(5),
         }
     }
 }
@@ -458,6 +462,13 @@ pub struct NanoTsDb {
     wal_bytes: u64,
     options: NanoTsOptions,
     tables: HashMap<String, TableBuffer>,
+    write_stats: WriteStats,
+}
+
+#[derive(Debug)]
+struct WriteStats {
+    window_start: Instant,
+    writes: u64,
 }
 
 #[derive(Clone)]
@@ -529,6 +540,10 @@ impl NanoTsDb {
             wal_bytes,
             options,
             tables: HashMap::new(),
+            write_stats: WriteStats {
+                window_start: Instant::now(),
+                writes: 0,
+            },
         };
 
         db.load_table_schemas()?;
@@ -626,6 +641,18 @@ impl NanoTsDb {
         Ok(())
     }
 
+    fn record_write(&mut self) {
+        let Some(opts) = &self.options.auto_maintenance else {
+            return;
+        };
+        let elapsed = self.write_stats.window_start.elapsed();
+        if elapsed >= opts.write_load_window {
+            self.write_stats.window_start = Instant::now();
+            self.write_stats.writes = 0;
+        }
+        self.write_stats.writes = self.write_stats.writes.saturating_add(1);
+    }
+
     pub fn append_row(&mut self, table: &str, ts_ms: i64, values: &[f64]) -> io::Result<u64> {
         if !self.tables.contains_key(table) && !self.storage.table_exists(table) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "table not found"));
@@ -672,7 +699,7 @@ impl NanoTsDb {
         ts_ms: i64,
         values: &[Value],
     ) -> io::Result<u64> {
-        let schema = &self.tables.get(table).unwrap().schema;
+        let schema = self.tables.get(table).unwrap().schema.clone();
         if values.len() != schema.columns.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -688,6 +715,7 @@ impl NanoTsDb {
             }
         }
 
+        self.record_write();
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
 
@@ -901,6 +929,29 @@ impl NanoTsDb {
             }
         }
         Ok((ts_sorted, cols_sorted))
+    }
+
+    pub fn query_table_range_typed_snapshot_with_predicates(
+        &self,
+        table: &str,
+        start_ms: i64,
+        end_ms: i64,
+        predicates: &[ColumnPredicate],
+    ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
+        let effective_start = match self.retention_cutoff_ms() {
+            Some(cutoff) => start_ms.max(cutoff),
+            None => start_ms,
+        };
+        let schema = self.storage.read_table_schema(table)?;
+        let snapshot_end = self.storage.file_len()?;
+        self.storage.read_table_columns_in_range_filtered_with_limit(
+            table,
+            &schema,
+            effective_start,
+            end_ms,
+            predicates,
+            Some(snapshot_end),
+        )
     }
 
     fn retention_cutoff_ms(&self) -> Option<i64> {
@@ -1344,6 +1395,19 @@ impl NanoTsDb {
         }
         Ok(self.wal_bytes >= total_bytes.saturating_mul(opts.wal_target_ratio))
     }
+
+    fn write_load_high(&self, opts: &AutoMaintenanceOptions) -> bool {
+        if opts.max_writes_per_sec == 0 {
+            return false;
+        }
+        let elapsed = self.write_stats.window_start.elapsed();
+        if elapsed.as_millis() == 0 {
+            return true;
+        }
+        let writes_per_sec = (self.write_stats.writes as u128 * 1000 / elapsed.as_millis())
+            .min(u64::MAX as u128) as u64;
+        writes_per_sec >= opts.max_writes_per_sec
+    }
 }
 
 fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptions) {
@@ -1368,7 +1432,7 @@ fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptio
                 Ok(should_pack) => should_pack,
                 Err(_) => continue,
             };
-            if should_pack {
+            if should_pack && !guard.write_load_high(&opts) {
                 let _ = guard.pack_all_tables(opts.target_segment_points);
             }
         }

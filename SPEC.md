@@ -183,10 +183,15 @@ Then repeated `ncols` times:
   - `2` = `TABLE_COL_F64_XOR` (Gorilla XOR-style)
   - `3` = `TABLE_COL_I64_D2` (compressed `i64`)
   - `4` = `TABLE_COL_BOOL` (bit-packed bools, LSB-first)
-  - `5` = `TABLE_COL_UTF8` (offsets + data)
+  - `5` = `TABLE_COL_UTF8` (dictionary + indices)
 - `col_len`: u32 (bytes)
 - `col_bytes`: `col_len` bytes (per codec)
   - `TABLE_COL_BOOL`: `ceil(count / 8)` bytes, bit `i` is value `i` (LSB-first)
+  - `TABLE_COL_UTF8`:
+    - `dict_count`: u32
+    - `dict_offsets`: `(dict_count + 1)` u32 (byte offsets)
+    - `dict_bytes`: concatenated UTF-8 bytes
+    - `indices`: `count` u32 indices into the dictionary
 
 
 ## Series segment payload (legacy single-column)

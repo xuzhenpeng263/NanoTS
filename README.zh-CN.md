@@ -1,18 +1,18 @@
 # NanoTS（社区版）
 
-一个用 Rust 编写的**可嵌入（In-Process）**、**仅追加（Append-only）**、**高性能**的时序存储内核。
+一个用 Rust 编写的**可嵌入**、**仅追加**、**高性能**时序存储内核。
 
 - **许可证**：AGPL-3.0-or-later
-- **定位**：类似 SQLite 的单机/边缘侧 TSDB Kernel（不是分布式集群）
-- **文档**：English（[README.md](README.md)、[CONTRIBUTING.md](CONTRIBUTING.md)、[SPEC.md](SPEC.md)）、中文（[README.zh-CN.md](README.zh-CN.md)、[CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)、[SPEC.zh-CN.md](SPEC.zh-CN.md)）
+- **定位**：类似 SQLite 的 *进程内* TSDB 内核（单机、边缘/嵌入式）
+- **文档**：English（[README.md](README.md)、[CONTRIBUTING.md](CONTRIBUTING.md)、[SPEC.md](SPEC.md)），中文（[README.zh-CN.md](README.zh-CN.md)、[CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)、[SPEC.zh-CN.md](SPEC.zh-CN.md)）
 
 ## 状态与兼容性
 
-当前为未发布状态（pre-release），磁盘格式可能随时调整。
+当前为未发布状态（pre-release），磁盘格式可能随时变更。
 
-## 本地测评（合成数据）
+## 基准测试（本地、合成数据）
 
-以下结果来自本地运行，数据为合成/理想数据（规律性很强）。仅作方向性参考。
+以下结果来自本地运行，数据为合成/理想数据（完美/平滑模式）。仅作方向性参考。
 
 | 测试 | 数据集 | 命令 | 结果 |
 | --- | --- | --- | --- |
@@ -20,63 +20,63 @@
 | 压缩比 | 10 万点，单表 | `python test_compression_ratio.py` | raw_total 1562.50 KB, on_disk 19.57 KB, ratio 79.82x |
 | 读性能 | 10 万点，单表 | `python test_read_perf.py` | avg 15.58 ms, p50 14.48 ms, p90 18.91 ms, p99 21.19 ms, 6,420,029 rows/s |
 
-
 ## 你能得到什么
 
-- **In-process**：像 SQLite 一样嵌入进宿主进程，不内置 HTTP Server
-- **单文件数据库**（可直接分享 `.ntt` 文件）
-- **Append-only + WAL + 崩溃恢复**
-- **列式表（v0）**：隐含 `ts_ms`，取值列目前仅支持 `f64`
-- **Retention/TTL**：通过手动 compaction/pack 做过期清理
-- **自适应值压缩（无损）**
-  - `col_codec=2`：`f64` Gorilla XOR
-  - `col_codec=3`：自动探测“浮点其实是整数”→ 转 `i64` 走 NanoTS 整数压缩器
-- **mmap 读路径**：读 `.ntt` 用 `mmap` + slice 解析，减少 syscalls，充分利用 OS page cache
-- **Arrow 零拷贝导出**：Apache Arrow C Data Interface
-- **Python 绑定**：PyO3/maturin，支持 Arrow capsule 导入
-- **记录大小上限可配置**：环境变量 `NANOTS_MAX_RECORD_SIZE`（默认 64MB）
+- **进程内**库 API（不内置 HTTP 服务）
+- **单文件 DB**（可分享 `.ntt` 文件）
+- **Append-only 存储 + WAL + 崩溃恢复**
+- **列式表**（v0：隐含 `ts_ms`，取值列仅 `f64`）
+- **Retention/TTL**：通过手动 compaction
+- **自适应值压缩**
+  - `col_codec=2`：浮点 Gorilla XOR
+  - `col_codec=3`：当浮点列值是精确整数时自动回退 → 用 NanoTS 整数压缩器编码为 `i64`
+- **mmap 读路径**（更少 syscalls，更友好的 OS 页缓存）
+- **Apache Arrow C Data Interface** 导出（零拷贝互操作）
+- **Python 绑定**（PyO3/maturin），支持 Arrow capsule 导入
+- **可配置的记录大小上限**：`NANOTS_MAX_RECORD_SIZE`（默认 64MB）
 
 ## 非目标（社区版）
 
-- 不做分布式/集群（Raft、复制等）
-- 不自研 SQL 语法（需要 SQL 可外接 DataFusion）
-- 不内置 Web UI（建议 Grafana）
-- 内核不做鉴权/RBAC
+- Clustering / Raft
+- 自研 SQL 解析器（如需可用 DataFusion 等外部引擎）
+- 内置仪表盘 / Web UI（用 Grafana）
+- 内核层的 Auth/RBAC
 
 ## 仓库结构
 
 - Rust 内核：`src/`（crate 名：`nanots`）
 - C 头文件：`include/nanots.h`
-- Python 绑定（独立 crate）：`python/nanots-py/`
+- Python 绑定 crate：`python/nanots-py/`
 - 文件格式规范：[SPEC.md](SPEC.md)
 
 ## 数据模型
 
-- 一个 **Table** = 隐含时间列 `ts_ms: i64`（毫秒） + N 个 `f64` 取值列。
-- 按行追加写：`append_row(table, ts_ms, values[])`。
+- 一个 **table** 有隐含时间列 `ts_ms: i64`（毫秒）。
+- 每个表有 **N 个取值列**，当前仅 `f64`（Float64 v0）。
+- 数据按行追加：`append_row(table, ts_ms, values[])`。
 
 说明：
 
-- `append(series, ts_ms, value)` 是便捷接口，本质是写单列 table。
-- Schema 写入 `.ntt` 单文件中（见 [SPEC.md](SPEC.md)）。
+- `append(series, ts_ms, value)` 是便捷 API，用于写单列表。
+- Schema 存在 `.ntt` 文件中（见 [SPEC.md](SPEC.md)）。
 
-## SQL（简化）
+## SQL（有限）
 
 - 支持语句：`CREATE TABLE`、`INSERT INTO ... VALUES ...`
-- 标识符支持不加引号，或使用双引号/反引号（例如 `"my_table"`、`` `my_table` ``）。
+- 标识符可以不加引号，或使用双引号/反引号（例如：`"my_table"`、`` `my_table` ``）。
 
 ## Rust 用法（详细）
 
-### 作为依赖引入（本地 path）
+### 作为依赖引入（本地路径）
 
-本仓库未发布到 crates.io，可用 path 依赖：
+本仓库未发布到 crates.io。在你的项目中：
 
 ```toml
 [dependencies]
 nanots = { path = "/path/to/ts_compressor_rust", features = ["arrow"] }
 ```
 
-### 最小示例：写入 + flush
+### 基础写入与 flush
 
 ```rust
 use nanots::{NanoTsDb, NanoTsOptions};
@@ -88,7 +88,7 @@ db.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-### 完整示例：多列 + 查询 + retention + 手动 pack
+### 多列、范围查询、retention、手动 pack
 
 ```rust
 use nanots::{NanoTsDb, NanoTsOptions};
@@ -111,8 +111,8 @@ for i in 0..10_000i64 {
 db.flush()?;
 
 let (ts_ms, cols) = db.query_table_range_columns("sensor", t0, t0 + 60_000)?;
-println!("rows={}", ts_ms.len());
 assert_eq!(cols.len(), 2);
+println!("rows={}", ts_ms.len());
 
 db.compact_retention_now()?;
 db.pack_table("sensor", 8192)?;
@@ -120,7 +120,7 @@ db.pack_table("sensor", 8192)?;
 # Ok::<(), std::io::Error>(())
 ```
 
-### 自动维护（后台 Pack + Retention）
+### 自动维护（后台 pack + retention）
 
 ```rust
 use nanots::{AutoMaintenanceOptions, NanoTsDbShared, NanoTsOptions};
@@ -134,20 +134,20 @@ let opts = NanoTsOptions {
 let db = NanoTsDbShared::open("data/nanots.ntt", opts)?;
 ```
 
-### Rust 接口速查
+### Rust API 一览（快速参考）
 
 - `NanoTsDb::open(path, opts)`：打开/创建 DB 目录
 - `create_table(table, columns)`：创建表 schema
 - `append_row(table, ts_ms, values)`：追加一行（先写 WAL）
 - `append(series, ts_ms, value)`：便捷单列写入
-- `flush()`：落盘为 `.ntt` 并截断 WAL
+- `flush()`：将缓冲区落盘到 `.ntt`，并 checkpoint + 截断 WAL
 - `query_table_range_columns(table, start, end)`：返回 `(ts_ms, cols)`
-- `pack_table(table, target_segment_points)`：手动 compaction（重写 segments）
-- `compact_retention_now()`：按 retention 删除过期数据
+- `pack_table(table, target_segment_points)`：手动 compaction（重写 segment）
+- `compact_retention_now()`：删除 retention 之前的点
 
 ## Python 用法（详细）
 
-### 构建并安装到当前环境（开发模式）
+### 构建并安装（开发模式）
 
 要求：Rust toolchain + Python + `maturin`。
 
@@ -156,10 +156,10 @@ cd python/nanots-py
 maturin develop --release
 ```
 
-该命令会把本地 `nanots` 扩展模块安装到当前 Python 环境。
+该命令会将本地 `nanots` 扩展模块安装到当前 Python 环境。
 类型提示位于 `python/nanots-py/nanots.pyi`。
 
-### 最小示例：写入 + flush
+### 基础写入与 flush
 
 ```python
 import nanots
@@ -169,7 +169,7 @@ db.append("sensor_x", 1704067200000, 25.5)
 db.flush()
 ```
 
-### 多列表：创建 + 写入 + 查询
+### 多列表
 
 ```python
 import nanots
@@ -187,7 +187,7 @@ ts_ms, cols = db.query_table_range_columns("sensor", t0, t0 + 60000)
 print("rows:", len(ts_ms), "cols:", len(cols))
 ```
 
-### Arrow 零拷贝导入到 PyArrow / Pandas
+### Arrow 零拷贝到 PyArrow / Pandas
 
 ```python
 import nanots
@@ -197,11 +197,11 @@ db = nanots.Db("./my_db.ntt")
 schema_capsule, array_capsule = db.query_table_range_arrow_capsules("sensor", 0, 10**18)
 batch = pyarrow.lib.RecordBatch._import_from_c_capsule(schema_capsule, array_capsule)
 
-df = batch.to_pandas()
+df = batch.to_pandas()  # 在 Arrow 侧尽可能零拷贝
 print(df.head())
 ```
 
-### Stats：空间占用与 codec 验证
+### Stats（空间统计与 codec 验证）
 
 ```python
 import nanots
@@ -221,11 +221,11 @@ db.pack_table("sensor", 8192)
 
 ## 文件格式
 
-详见 [SPEC.md](SPEC.md) / [SPEC.zh-CN.md](SPEC.zh-CN.md)，包含单文件记录布局与各 payload 格式。
+详见 [SPEC.md](SPEC.md) 中的单文件记录布局与各 payload 格式。
 
 ## 构建与测试
 
-内核测试（离线也能跑）：
+内核测试（可离线运行）：
 
 ```bash
 cargo test --offline --features arrow

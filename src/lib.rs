@@ -15,7 +15,7 @@ pub mod arrow;
 #[cfg(feature = "datafusion")]
 pub mod datafusion;
 
-mod c_api;
+pub mod c_api;
 
 pub use crate::db::{AutoMaintenanceOptions, NanoTsDb, NanoTsDbShared, NanoTsOptions, Point};
 pub use crate::storage::TableStats;

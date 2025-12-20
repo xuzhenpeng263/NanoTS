@@ -161,10 +161,15 @@ Extension header（v1+）：
   - `2` = `TABLE_COL_F64_XOR`（Gorilla XOR 风格）
   - `3` = `TABLE_COL_I64_D2`（`i64` 压缩存储）
   - `4` = `TABLE_COL_BOOL`（bool 位图，低位在前）
-  - `5` = `TABLE_COL_UTF8`（offsets + data）
+  - `5` = `TABLE_COL_UTF8`（字典 + 索引）
 - `col_len`：u32（bytes）
 - `col_bytes`：`col_len` bytes（按 codec 编码）
   - `TABLE_COL_BOOL`：`ceil(count / 8)` 字节，bit `i` 表示第 `i` 个值（低位在前）
+  - `TABLE_COL_UTF8`：
+    - `dict_count`：u32
+    - `dict_offsets`：`(dict_count + 1)` 个 u32（字节偏移）
+    - `dict_bytes`：拼接的 UTF-8 字节
+    - `indices`：`count` 个 u32（字典索引）
 
 
 ## Series Segment Payload（历史单列）

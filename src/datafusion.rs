@@ -301,7 +301,7 @@ impl TableProvider for NanoTsTable {
         let limit_copy = limit;
         let batches = task::spawn_blocking(move || {
             let (ts, cols) = db
-                .query_table_range_typed_with_predicates(&table, start, end, &predicates)
+                .query_table_range_typed_snapshot_with_predicates(&table, start, end, &predicates)
                 .map_err(|e| DataFusionError::Execution(format!("query failed: {e}")))?;
             NanoTsTable::build_batches(schema, ts, cols, limit_copy)
         })

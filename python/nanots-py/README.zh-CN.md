@@ -1,8 +1,8 @@
-# nanots (Python)
+# nanots（Python）
 
-Python bindings for NanoTS (Community Edition).
+NanoTS（社区版）的 Python 绑定。
 
-## Build (local)
+## 构建（本地）
 
 ```bash
 cd python/nanots-py
@@ -10,21 +10,21 @@ maturin develop --release
 python -c "import nanots; print(nanots.__version__)"
 ```
 
-## Arrow zero-copy export
+## Arrow 零拷贝导出
 
-`Db.query_table_range_arrow_capsules(...)` returns `(array_capsule, schema_capsule)` compatible with:
+`Db.query_table_range_arrow_capsules(...)` 返回 `(array_capsule, schema_capsule)`，可用于：
 
 ```python
 import pyarrow as pa
 schema_capsule, array_capsule = db.query_table_range_arrow_capsules("sensor", t1, t2)
 struct_arr = pa.Array._import_from_c(array_capsule, schema_capsule)
-# struct_arr is a StructArray with fields: ts_ms + schema columns
+# struct_arr 是一个 StructArray，字段：ts_ms + schema 列
 table = pa.Table.from_struct_array(struct_arr)
 ```
 
-For best throughput, prefer Arrow export over Python object conversion.
+为获得最佳吞吐量，优先使用 Arrow 导出而非 Python 对象转换。
 
-If your PyArrow supports it, you can also do:
+如果你的 PyArrow 支持，也可以这样：
 
 ```python
 import pyarrow.lib
@@ -32,7 +32,7 @@ schema_capsule, array_capsule = db.query_table_range_arrow_capsules("sensor", t1
 batch = pyarrow.lib.RecordBatch._import_from_c_capsule(schema_capsule, array_capsule)
 ```
 
-## Auto maintenance options
+## 自动维护选项
 
 ```python
 db = nanots.Db(
@@ -49,7 +49,7 @@ db = nanots.Db(
 )
 ```
 
-## Power loss simulation
+## 断电模拟
 
 ```bash
 python test_power_loss.py --reset --rounds 20

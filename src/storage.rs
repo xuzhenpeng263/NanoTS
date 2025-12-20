@@ -127,6 +127,10 @@ impl Storage {
         Ok(total)
     }
 
+    pub fn file_len(&self) -> io::Result<u64> {
+        Ok(File::open(&self.path)?.metadata()?.len())
+    }
+
     pub fn write_table_schema(&self, table: &str, schema: &TableSchema) -> io::Result<()> {
         let schema_bytes = encode_table_schema_bytes(schema)?;
         let payload = encode_named_payload(table, &schema_bytes)?;
@@ -399,7 +403,14 @@ impl Storage {
         start_ms: i64,
         end_ms: i64,
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
-        self.read_table_columns_in_range_filtered(table, schema, start_ms, end_ms, &[])
+        self.read_table_columns_in_range_filtered_with_limit(
+            table,
+            schema,
+            start_ms,
+            end_ms,
+            &[],
+            None,
+        )
     }
 
     pub fn read_table_columns_in_range_filtered(
@@ -409,6 +420,25 @@ impl Storage {
         start_ms: i64,
         end_ms: i64,
         predicates: &[ColumnPredicate],
+    ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
+        self.read_table_columns_in_range_filtered_with_limit(
+            table,
+            schema,
+            start_ms,
+            end_ms,
+            predicates,
+            None,
+        )
+    }
+
+    pub fn read_table_columns_in_range_filtered_with_limit(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        start_ms: i64,
+        end_ms: i64,
+        predicates: &[ColumnPredicate],
+        max_offset: Option<u64>,
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
         let index = self.load_or_rebuild_table_index(table)?;
         if index.is_empty() {
@@ -441,6 +471,11 @@ impl Storage {
         let mapped_predicates = map_predicates(schema, predicates);
 
         for e in index {
+            if let Some(max_offset) = max_offset {
+                if e.offset.saturating_add(e.len) > max_offset {
+                    continue;
+                }
+            }
             if e.max_ts < start_ms || e.min_ts > end_ms {
                 continue;
             }
@@ -921,40 +956,88 @@ fn read_table_segment_from_bytes(mut data: &[u8], schema: &TableSchema) -> io::R
                 if ccodec != TABLE_COL_UTF8 {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
                 }
-                let need_offsets = (count + 1)
-                    .checked_mul(4)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
-                if blob.len() < need_offsets {
+                if blob.len() < 4 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "short utf8 column",
                     ));
                 }
-                let mut offsets: Vec<u32> = Vec::with_capacity(count + 1);
-                for i in 0..=count {
-                    let start = i * 4;
-                    let off = u32::from_le_bytes(blob[start..start + 4].try_into().unwrap());
-                    offsets.push(off);
+                let dict_count = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+                let offsets_bytes_len = (dict_count + 1)
+                    .checked_mul(4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
+                let header_len = 4 + offsets_bytes_len;
+                if blob.len() < header_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "short utf8 column",
+                    ));
                 }
-                let data_bytes = &blob[need_offsets..];
+                let mut dict_offsets: Vec<u32> = Vec::with_capacity(dict_count + 1);
+                for i in 0..=dict_count {
+                    let start = 4 + i * 4;
+                    let off = u32::from_le_bytes(blob[start..start + 4].try_into().unwrap());
+                    dict_offsets.push(off);
+                }
+                let dict_bytes_len = *dict_offsets
+                    .last()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short utf8 dict"))?
+                    as usize;
+                let dict_start = header_len;
+                let dict_end = dict_start + dict_bytes_len;
+                if dict_end > blob.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad utf8 dict offsets",
+                    ));
+                }
+                let indices_len = count
+                    .checked_mul(4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
+                let indices_start = dict_end;
+                let indices_end = indices_start + indices_len;
+                if indices_end != blob.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad utf8 indices length",
+                    ));
+                }
+                let dict_bytes = &blob[dict_start..dict_end];
+                let mut dict: Vec<String> = Vec::with_capacity(dict_count);
+                for i in 0..dict_count {
+                    let start = dict_offsets[i] as usize;
+                    let end = dict_offsets[i + 1] as usize;
+                    if start > end || end > dict_bytes.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "bad utf8 dict offsets",
+                        ));
+                    }
+                    let s = std::str::from_utf8(&dict_bytes[start..end]).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bad utf8 data")
+                    })?;
+                    dict.push(s.to_string());
+                }
+                let mut indices: Vec<u32> = Vec::with_capacity(count);
+                for i in 0..count {
+                    let start = indices_start + i * 4;
+                    let idx = u32::from_le_bytes(blob[start..start + 4].try_into().unwrap());
+                    indices.push(idx);
+                }
                 let mut out: Vec<Option<String>> = Vec::with_capacity(count);
                 for i in 0..count {
                     if !null_bytes.is_empty() && !is_valid(&null_bytes, i) {
                         out.push(None);
                         continue;
                     }
-                    let start = offsets[i] as usize;
-                    let end = offsets[i + 1] as usize;
-                    if start > end || end > data_bytes.len() {
+                    let idx = indices[i] as usize;
+                    if idx >= dict.len() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "bad utf8 offsets",
+                            "utf8 dict index out of bounds",
                         ));
                     }
-                    let s = std::str::from_utf8(&data_bytes[start..end]).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "bad utf8 data")
-                    })?;
-                    out.push(Some(s.to_string()));
+                    out.push(Some(dict[idx].clone()));
                 }
                 cols.push(ColumnData::Utf8(out));
             }
@@ -1513,36 +1596,62 @@ fn encode_table_segment(
             }
             (ColumnData::Utf8(values), ColumnType::Utf8) => {
                 let nulls = build_null_bitmap(values);
-                let mut offsets: Vec<u32> = Vec::with_capacity(values.len() + 1);
-                let mut data_bytes: Vec<u8> = Vec::new();
-                offsets.push(0);
+                let mut dict: Vec<String> = Vec::new();
+                let mut dict_map: HashMap<String, u32> = HashMap::new();
+                let mut indices: Vec<u32> = Vec::with_capacity(values.len());
                 for v in values {
                     if let Some(s) = v {
-                        let bytes = s.as_bytes();
-                        if data_bytes.len() + bytes.len() > u32::MAX as usize {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "utf8 data exceeds u32::MAX",
-                            ));
+                        if let Some(idx) = dict_map.get(s) {
+                            indices.push(*idx);
+                        } else {
+                            let idx = dict.len() as u32;
+                            dict.push(s.clone());
+                            dict_map.insert(s.clone(), idx);
+                            indices.push(idx);
                         }
-                        data_bytes.extend_from_slice(bytes);
+                    } else {
+                        indices.push(0);
                     }
-                    offsets.push(data_bytes.len() as u32);
                 }
-                let offsets_bytes_len = offsets
+                let dict_count = checked_u32_len(dict.len(), "utf8 dict exceeds u32::MAX")?;
+                let mut dict_offsets: Vec<u32> = Vec::with_capacity(dict.len() + 1);
+                let mut dict_bytes: Vec<u8> = Vec::new();
+                dict_offsets.push(0);
+                for s in &dict {
+                    let bytes = s.as_bytes();
+                    if dict_bytes.len() + bytes.len() > u32::MAX as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "utf8 dict bytes exceed u32::MAX",
+                        ));
+                    }
+                    dict_bytes.extend_from_slice(bytes);
+                    dict_offsets.push(dict_bytes.len() as u32);
+                }
+                let offsets_bytes_len = dict_offsets
                     .len()
                     .checked_mul(4)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
-                let blob_len = offsets_bytes_len
-                    .checked_add(data_bytes.len())
+                let indices_bytes_len = indices
+                    .len()
+                    .checked_mul(4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+                let blob_len = 4usize
+                    .checked_add(offsets_bytes_len)
+                    .and_then(|v| v.checked_add(dict_bytes.len()))
+                    .and_then(|v| v.checked_add(indices_bytes_len))
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
                 let blob_len_u32 =
                     checked_u32_len(blob_len, "utf8 column bytes exceed u32::MAX")?;
                 let mut blob = Vec::with_capacity(blob_len);
-                for off in offsets {
+                blob.extend_from_slice(&dict_count.to_le_bytes());
+                for off in dict_offsets {
                     blob.extend_from_slice(&off.to_le_bytes());
                 }
-                blob.extend_from_slice(&data_bytes);
+                blob.extend_from_slice(&dict_bytes);
+                for idx in indices {
+                    blob.extend_from_slice(&idx.to_le_bytes());
+                }
                 if let Some(nulls) = nulls {
                     let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
                     out.extend_from_slice(&null_len.to_le_bytes());

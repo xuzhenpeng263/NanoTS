@@ -392,6 +392,12 @@ fn parse_auto_maintenance(
         if let Ok(Some(v)) = dict.get_item("target_segment_points") {
             opts.target_segment_points = v.extract::<usize>()?;
         }
+        if let Ok(Some(v)) = dict.get_item("max_writes_per_sec") {
+            opts.max_writes_per_sec = v.extract::<u64>()?;
+        }
+        if let Ok(Some(v)) = dict.get_item("write_load_window_ms") {
+            opts.write_load_window = Duration::from_millis(v.extract::<u64>()?);
+        }
         return Ok(Some(opts));
     }
     Err(PyRuntimeError::new_err(
