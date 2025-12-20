@@ -850,6 +850,83 @@ impl NanoTsDb {
         self.append_row_values(table, ts_ms, values)
     }
 
+    pub fn append_table_batch(
+        &mut self,
+        table: &str,
+        ts_ms: &[i64],
+        cols: &[ColumnData],
+    ) -> io::Result<u64> {
+        if ts_ms.is_empty() {
+            return Ok(0);
+        }
+        if !self.tables.contains_key(table) && !self.storage.table_exists(table) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "table not found"));
+        }
+        if !self.tables.contains_key(table) {
+            let schema = self.storage.read_table_schema(table)?;
+            self.tables.insert(
+                table.to_string(),
+                TableBuffer {
+                    schema,
+                    rows: Vec::new(),
+                },
+            );
+        }
+        let schema = self.tables.get(table).unwrap().schema.clone();
+        if cols.len() != schema.columns.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "column length mismatch",
+            ));
+        }
+        for (col, schema_col) in cols.iter().zip(schema.columns.iter()) {
+            let len = match col {
+                ColumnData::F64(v) => v.len(),
+                ColumnData::I64(v) => v.len(),
+                ColumnData::Bool(v) => v.len(),
+                ColumnData::Utf8(v) => v.len(),
+            };
+            if len != ts_ms.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "column length mismatch",
+                ));
+            }
+            let type_ok = matches!(
+                (col, schema_col.col_type),
+                (ColumnData::F64(_), ColumnType::F64)
+                    | (ColumnData::I64(_), ColumnType::I64)
+                    | (ColumnData::Bool(_), ColumnType::Bool)
+                    | (ColumnData::Utf8(_), ColumnType::Utf8)
+            );
+            if !type_ok {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "column type mismatch",
+                ));
+            }
+        }
+
+        let mut values: Vec<Value> = vec![Value::Null; schema.columns.len()];
+        let mut appended = 0u64;
+        for row in 0..ts_ms.len() {
+            for (cidx, col) in cols.iter().enumerate() {
+                values[cidx] = match col {
+                    ColumnData::F64(v) => v[row].map(Value::F64).unwrap_or(Value::Null),
+                    ColumnData::I64(v) => v[row].map(Value::I64).unwrap_or(Value::Null),
+                    ColumnData::Bool(v) => v[row].map(Value::Bool).unwrap_or(Value::Null),
+                    ColumnData::Utf8(v) => v[row]
+                        .as_ref()
+                        .map(|s| Value::Utf8(s.clone()))
+                        .unwrap_or(Value::Null),
+                };
+            }
+            self.append_row_values(table, ts_ms[row], &values)?;
+            appended = appended.saturating_add(1);
+        }
+        Ok(appended)
+    }
+
     fn append_row_values(
         &mut self,
         table: &str,
@@ -1902,6 +1979,45 @@ mod tests {
         for col in &table.columns {
             assert!(col.rows >= 2);
             assert!(col.stored_bytes > 0);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_append_table_batch() {
+        let path = fresh_db_path("append_table_batch");
+        let mut db = NanoTsDb::open(&path, NanoTsOptions::default()).unwrap();
+        db.create_table_typed(
+            "t",
+            &[
+                ("temp", ColumnType::F64),
+                ("flag", ColumnType::Bool),
+                ("tag", ColumnType::Utf8),
+            ],
+        )
+        .unwrap();
+
+        let ts = vec![1000, 1001, 1002];
+        let cols = vec![
+            ColumnData::F64(vec![Some(1.0), Some(2.0), None]),
+            ColumnData::Bool(vec![Some(true), None, Some(false)]),
+            ColumnData::Utf8(vec![
+                Some("a".to_string()),
+                None,
+                Some("b".to_string()),
+            ]),
+        ];
+        let appended = db.append_table_batch("t", &ts, &cols).unwrap();
+        assert_eq!(appended, 3);
+        db.flush().unwrap();
+
+        let (out_ts, out_cols) = db.query_table_range_typed("t", 0, 10_000).unwrap();
+        assert_eq!(out_ts.len(), 3);
+        assert_eq!(out_cols.len(), 3);
+        assert_eq!(out_ts, ts);
+        match &out_cols[0] {
+            ColumnData::F64(v) => assert_eq!(v[0], Some(1.0)),
+            _ => panic!("unexpected column type"),
         }
         let _ = fs::remove_file(path);
     }

@@ -352,25 +352,8 @@ impl Db {
             return Err(PyRuntimeError::new_err("column length mismatch"));
         }
 
-        let mut values: Vec<Value> = vec![Value::Null; schema.columns.len()];
-        let mut appended = 0u64;
-        for row in 0..ts_ms.len() {
-            for (cidx, col) in columns.iter().enumerate() {
-                values[cidx] = match col {
-                    ColumnData::F64(v) => v[row].map(Value::F64).unwrap_or(Value::Null),
-                    ColumnData::I64(v) => v[row].map(Value::I64).unwrap_or(Value::Null),
-                    ColumnData::Bool(v) => v[row].map(Value::Bool).unwrap_or(Value::Null),
-                    ColumnData::Utf8(v) => v[row]
-                        .as_ref()
-                        .map(|s| Value::Utf8(s.clone()))
-                        .unwrap_or(Value::Null),
-                };
-            }
-            db.append_row_typed(table, ts_ms[row], &values)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            appended = appended.saturating_add(1);
-        }
-        Ok(appended)
+        db.append_table_batch(table, &ts_ms, &columns)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Returns an Arrow C Stream capsule for SQL query results.
