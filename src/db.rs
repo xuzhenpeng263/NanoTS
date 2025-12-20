@@ -596,7 +596,9 @@ impl NanoTsDb {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
 
-        if schema.columns.iter().all(|c| c.col_type == ColumnType::F64) {
+        let all_f64 = schema.columns.iter().all(|c| c.col_type == ColumnType::F64);
+        let has_null = values.iter().any(|v| matches!(v, Value::Null));
+        if all_f64 && !has_null {
             let mut raw: Vec<f64> = Vec::with_capacity(values.len());
             for v in values {
                 match v {

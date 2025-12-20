@@ -16,7 +16,7 @@
 
 | 测试 | 数据集 | 命令 | 结果 |
 | --- | --- | --- | --- |
-| 压缩体积 | 10 万点，单列 `f64`，单表 | `python test_final.py` | `.ntt` 体积 5612.29 KB，对比原始约 800 KB |
+| 压缩体积 | 10 万点，单列 `f64`，单表 | `python test_final.py` | `.ntt` 体积 5612.29 KB（pack 前），pack 后 624.74 KB；原始约 800 KB |
 | 压缩比 | 10 万点，单表 | `python test_compression_ratio.py` | raw_total 1562.50 KB, on_disk 19.57 KB, ratio 79.82x |
 | 读性能 | 10 万点，单表 | `python test_read_perf.py` | avg 15.58 ms, p50 14.48 ms, p90 18.91 ms, p99 21.19 ms, 6,420,029 rows/s |
 

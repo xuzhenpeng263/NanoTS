@@ -34,6 +34,12 @@ db.flush()
 size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
 print(f">>> .ntt size: {size / 1024:.2f} KB (raw would be ~800 KB for 100k f64)")
 
+print(">>> pack (compact)")
+db.pack_table("sensor_x", 8192)
+
+size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+print(f">>> .ntt size after pack: {size / 1024:.2f} KB")
+
 print(">>> arrow read (zero-copy)")
 schema_capsule, array_capsule = db.query_table_range_arrow_capsules(
     "sensor_x", ts_base, ts_base + count * 1000

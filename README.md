@@ -16,7 +16,7 @@ These numbers are from local runs and synthetic data (perfect/smooth patterns). 
 
 | Test | Dataset | Command | Result |
 | --- | --- | --- | --- |
-| Compression size | 100k points, single-column `f64`, single table | `python test_final.py` | `.ntt` size 5612.29 KB vs raw ~800 KB |
+| Compression size | 100k points, single-column `f64`, single table | `python test_final.py` | `.ntt` size 5612.29 KB (pre-pack), 624.74 KB after pack; raw ~800 KB |
 | Compression ratio | 100k points, single table | `python test_compression_ratio.py` | raw_total 1562.50 KB, on_disk 19.57 KB, ratio 79.82x |
 | Read perf | 100k points, single table | `python test_read_perf.py` | avg 15.58 ms, p50 14.48 ms, p90 18.91 ms, p99 21.19 ms, 6,420,029 rows/s |
 

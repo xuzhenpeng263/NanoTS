@@ -241,20 +241,30 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             "invalid WAL record header",
         ));
     }
+    fn read_exact<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+        if payload.len() < pos.saturating_add(len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short WAL payload",
+            ));
+        }
+        let out = &payload[*pos..*pos + len];
+        *pos += len;
+        Ok(out)
+    }
+
     let mut pos = 5usize;
-    let record_type = payload[pos];
-    pos += 1;
+    let record_type = read_exact(payload, &mut pos, 1)?[0];
     match record_type {
         RECORD_APPEND => {
-            let seq = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let series_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
-            let series_bytes = &payload[pos..pos + series_len];
-            pos += series_len;
-            let ts_ms = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let value = f64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            let seq = u64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
+            let series_len =
+                u16::from_le_bytes(read_exact(payload, &mut pos, 2)?.try_into().unwrap()) as usize;
+            let series_bytes = read_exact(payload, &mut pos, series_len)?;
+            let ts_ms =
+                i64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
+            let value =
+                f64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
 
             let series = std::str::from_utf8(series_bytes).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid series utf-8")
@@ -268,21 +278,19 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             })
         }
         RECORD_APPEND_ROW => {
-            let seq = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let table_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
-            let table_bytes = &payload[pos..pos + table_len];
-            pos += table_len;
-            let ts_ms = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let ncols = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
+            let seq = u64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
+            let table_len =
+                u16::from_le_bytes(read_exact(payload, &mut pos, 2)?.try_into().unwrap()) as usize;
+            let table_bytes = read_exact(payload, &mut pos, table_len)?;
+            let ts_ms =
+                i64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
+            let ncols =
+                u16::from_le_bytes(read_exact(payload, &mut pos, 2)?.try_into().unwrap()) as usize;
 
             let need = ncols
                 .checked_mul(8)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
-            if payload.len() < pos + need {
+            if payload.len() < pos.saturating_add(need) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "short WAL row payload",
@@ -290,8 +298,8 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             }
             let mut values: Vec<f64> = Vec::with_capacity(ncols);
             for _ in 0..ncols {
-                let v = f64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-                pos += 8;
+                let v =
+                    f64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
                 values.push(v);
             }
 
@@ -307,82 +315,41 @@ fn decode_wal_payload(payload: &[u8]) -> io::Result<WalRecordOwned> {
             })
         }
         RECORD_APPEND_ROW_TYPED => {
-            let seq = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let table_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
-            let table_bytes = &payload[pos..pos + table_len];
-            pos += table_len;
-            let ts_ms = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let ncols = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
+            let seq = u64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
+            let table_len =
+                u16::from_le_bytes(read_exact(payload, &mut pos, 2)?.try_into().unwrap()) as usize;
+            let table_bytes = read_exact(payload, &mut pos, table_len)?;
+            let ts_ms =
+                i64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
+            let ncols =
+                u16::from_le_bytes(read_exact(payload, &mut pos, 2)?.try_into().unwrap()) as usize;
 
             let mut values: Vec<crate::db::Value> = Vec::with_capacity(ncols);
             for _ in 0..ncols {
-                if payload.len() <= pos {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "short typed WAL payload",
-                    ));
-                }
-                let tag = payload[pos];
-                pos += 1;
+                let tag = read_exact(payload, &mut pos, 1)?[0];
                 match tag {
                     WAL_VAL_NULL => values.push(crate::db::Value::Null),
                     WAL_VAL_F64 => {
-                        if payload.len() < pos + 8 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "short typed WAL payload",
-                            ));
-                        }
-                        let v = f64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-                        pos += 8;
+                        let v =
+                            f64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
                         values.push(crate::db::Value::F64(v));
                     }
                     WAL_VAL_I64 => {
-                        if payload.len() < pos + 8 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "short typed WAL payload",
-                            ));
-                        }
-                        let v = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-                        pos += 8;
+                        let v =
+                            i64::from_le_bytes(read_exact(payload, &mut pos, 8)?.try_into().unwrap());
                         values.push(crate::db::Value::I64(v));
                     }
                     WAL_VAL_BOOL => {
-                        if payload.len() < pos + 1 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "short typed WAL payload",
-                            ));
-                        }
-                        let v = payload[pos] != 0;
-                        pos += 1;
+                        let v = read_exact(payload, &mut pos, 1)?[0] != 0;
                         values.push(crate::db::Value::Bool(v));
                     }
                     WAL_VAL_UTF8 => {
-                        if payload.len() < pos + 4 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "short typed WAL payload",
-                            ));
-                        }
                         let len =
-                            u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-                        pos += 4;
-                        if payload.len() < pos + len {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "short typed WAL payload",
-                            ));
-                        }
-                        let s = std::str::from_utf8(&payload[pos..pos + len]).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8")
-                        })?;
-                        pos += len;
+                            u32::from_le_bytes(read_exact(payload, &mut pos, 4)?.try_into().unwrap())
+                                as usize;
+                        let s = std::str::from_utf8(read_exact(payload, &mut pos, len)?).map_err(
+                            |_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"),
+                        )?;
                         values.push(crate::db::Value::Utf8(s.to_string()));
                     }
                     _ => {

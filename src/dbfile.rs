@@ -121,6 +121,7 @@ where
     F: FnMut(RecordHeader, &[u8]) -> io::Result<()>,
 {
     let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut hdr = [0u8; 5];
     if reader.read_exact(&mut hdr).is_err() {
@@ -144,6 +145,14 @@ where
         let payload_len = u32::from_le_bytes(head[1..5].try_into().unwrap());
         let payload_offset = offset + 5;
         offset += 5;
+        let remaining = file_len.saturating_sub(offset);
+        let needed = payload_len as u64 + 4;
+        if remaining < needed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record length out of bounds",
+            ));
+        }
 
         let mut payload = vec![0u8; payload_len as usize];
         if let Err(e) = reader.read_exact(&mut payload) {
