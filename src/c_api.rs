@@ -196,6 +196,10 @@ pub extern "C" fn nanots_query_range(
         });
     }
     let len = out.len();
+    if len == 0 {
+        unsafe { *out_len = 0 };
+        return ptr::null_mut();
+    }
     let ptr = out.as_mut_ptr();
     std::mem::forget(out);
     unsafe { *out_len = len };
@@ -204,7 +208,7 @@ pub extern "C" fn nanots_query_range(
 
 #[no_mangle]
 pub extern "C" fn nanots_query_free(ptr: *mut NanotsPoint, len: usize) {
-    if ptr.is_null() || len == 0 {
+    if ptr.is_null() {
         return;
     }
     unsafe {

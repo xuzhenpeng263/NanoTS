@@ -287,6 +287,9 @@ impl PrivateData {
                         if let Some(s) = v {
                             data.extend_from_slice(s.as_bytes());
                         }
+                        if data.len() > i32::MAX as usize {
+                            return Err(ArrowExportError);
+                        }
                         offsets.push(data.len() as i32);
                     }
                     ColumnBufferData::Utf8 {

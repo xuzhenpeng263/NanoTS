@@ -236,6 +236,14 @@ impl Db {
         use datafusion::arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
         use std::sync::Arc;
 
+        {
+            let mut db = self
+                .inner
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+            db.flush()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
         let db = Arc::new(
             NanoTsDb::open(&self.path, NanoTsOptions::default())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,

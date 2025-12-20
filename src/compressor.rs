@@ -170,6 +170,7 @@ fn uvarint_decode(buf: &[u8], pos: usize) -> Result<(u64, usize), &'static str> 
     let mut val = 0u64;
     let mut shift = 0;
     let mut pos = pos;
+    let mut count = 0;
 
     loop {
         if pos >= buf.len() {
@@ -177,11 +178,18 @@ fn uvarint_decode(buf: &[u8], pos: usize) -> Result<(u64, usize), &'static str> 
         }
         let b = buf[pos];
         pos += 1;
+        count += 1;
+        if count > 10 {
+            return Err("uvarint_decode: overflow");
+        }
         val |= ((b & 0x7F) as u64) << shift;
         if (b & 0x80) == 0 {
             return Ok((val, pos));
         }
         shift += 7;
+        if shift >= 64 {
+            return Err("uvarint_decode: overflow");
+        }
     }
 }
 
