@@ -1836,9 +1836,11 @@ fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptio
             if guard.options.retention.is_some()
                 && last_retention.elapsed() >= opts.retention_check_interval
             {
-                let result = guard.compact_retention_now();
-                guard.record_retention_result(&result);
-                last_retention = std::time::Instant::now();
+                if !guard.write_load_high(&opts) && guard.idle_for_pack(&opts) {
+                    let result = guard.compact_retention_now();
+                    guard.record_retention_result(&result);
+                    last_retention = std::time::Instant::now();
+                }
             }
             let should_pack = match guard.should_auto_pack(&opts) {
                 Ok(should_pack) => should_pack,

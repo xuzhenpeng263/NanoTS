@@ -66,6 +66,19 @@ int64_t nanots_append_row(
     const double* values,
     size_t nvals);
 
+// Appends a batch of rows for a multi-column Float64 table.
+// `ts_ms` has `nrows` entries.
+// `values` is row-major with length `nrows * ncols`:
+//   values[row * ncols + col]
+// Returns number of appended rows on success, or a negative error code.
+int64_t nanots_append_rows(
+    NanotsHandle* handle,
+    const char* table,
+    const int64_t* ts_ms,
+    size_t nrows,
+    const double* values,
+    size_t ncols);
+
 // Queries points in [start_ms, end_ms]. Returns a heap-allocated array and writes its length to `out_len`.
 // Free the returned pointer with `nanots_query_free`.
 NanotsPoint* nanots_query_range(

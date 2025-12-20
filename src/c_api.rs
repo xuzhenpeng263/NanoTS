@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use crate::db::{NanoTsDb, NanoTsOptions, Point};
+use crate::db::{ColumnData, NanoTsDb, NanoTsOptions, Point};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_longlong};
 use std::ptr;
@@ -158,6 +158,53 @@ pub extern "C" fn nanots_append_row(
     };
     match db.append_row(&table, ts_ms as i64, slice) {
         Ok(seq) => seq as c_longlong,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nanots_append_rows(
+    handle: *mut NanotsHandle,
+    table: *const c_char,
+    ts_ms: *const c_longlong,
+    nrows: usize,
+    values: *const f64,
+    ncols: usize,
+) -> c_longlong {
+    if handle.is_null() {
+        return -2;
+    }
+    let Ok(table) = cstr_to_string(table) else {
+        return -3;
+    };
+    if (ts_ms.is_null() && nrows != 0) || (values.is_null() && nrows != 0 && ncols != 0) {
+        return -2;
+    }
+    if nrows == 0 {
+        return 0;
+    }
+    if ncols == 0 {
+        return -2;
+    }
+    let ts_slice = unsafe { std::slice::from_raw_parts(ts_ms, nrows) };
+    let values_slice = unsafe { std::slice::from_raw_parts(values, nrows * ncols) };
+
+    let mut cols: Vec<ColumnData> = Vec::with_capacity(ncols);
+    for col in 0..ncols {
+        let mut out: Vec<Option<f64>> = Vec::with_capacity(nrows);
+        for row in 0..nrows {
+            out.push(Some(values_slice[row * ncols + col]));
+        }
+        cols.push(ColumnData::F64(out));
+    }
+    let ts_vec: Vec<i64> = ts_slice.iter().map(|v| *v as i64).collect();
+
+    let handle = unsafe { &*handle };
+    let Ok(mut db) = handle.db.lock() else {
+        return -4;
+    };
+    match db.append_table_batch(&table, &ts_vec, &cols) {
+        Ok(rows) => rows as c_longlong,
         Err(_) => -1,
     }
 }

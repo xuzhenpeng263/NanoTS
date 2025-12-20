@@ -2689,7 +2689,10 @@ fn decode_table_index_payload(
 }
 
 fn load_state_from_footer(path: &Path) -> io::Result<Option<StorageState>> {
-    let mut footer_offset = dbfile::read_footer_offset(path)?;
+    let mut footer_offset = match dbfile::read_footer_offset(path) {
+        Ok(offset) => offset,
+        Err(_) => 0,
+    };
     if footer_offset == 0 {
         if let Some(fallback) = dbfile::find_last_footer_offset(path)? {
             footer_offset = fallback;
