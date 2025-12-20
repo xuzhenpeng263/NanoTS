@@ -34,6 +34,7 @@ These numbers are from local runs and synthetic data (perfect/smooth patterns). 
 - **mmap read path** for disk reads (fewer syscalls, OS page cache friendly)
 - **Apache Arrow C Data Interface** export (zero-copy interop)
 - **Python bindings** (PyO3/maturin) with Arrow capsule import
+- **Configurable record size limit** via `NANOTS_MAX_RECORD_SIZE` (default: 64MB)
 
 ## Non-goals (Community Edition)
 
@@ -59,6 +60,11 @@ Notes:
 
 - `append(series, ts_ms, value)` is a convenience API that writes to a single-column table.
 - Schema is stored in the `.ntt` file (see [SPEC.md](SPEC.md)).
+
+## SQL (limited)
+
+- Supported statements: `CREATE TABLE`, `INSERT INTO ... VALUES ...`
+- Identifiers may be unquoted or quoted using double quotes or backticks (e.g. `"my_table"`, `` `my_table` ``).
 
 ## Rust usage (detailed)
 

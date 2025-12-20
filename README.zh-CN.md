@@ -34,6 +34,7 @@
 - **mmap 读路径**：读 `.ntt` 用 `mmap` + slice 解析，减少 syscalls，充分利用 OS page cache
 - **Arrow 零拷贝导出**：Apache Arrow C Data Interface
 - **Python 绑定**：PyO3/maturin，支持 Arrow capsule 导入
+- **记录大小上限可配置**：环境变量 `NANOTS_MAX_RECORD_SIZE`（默认 64MB）
 
 ## 非目标（社区版）
 
@@ -58,6 +59,11 @@
 
 - `append(series, ts_ms, value)` 是便捷接口，本质是写单列 table。
 - Schema 写入 `.ntt` 单文件中（见 [SPEC.md](SPEC.md)）。
+
+## SQL（简化）
+
+- 支持语句：`CREATE TABLE`、`INSERT INTO ... VALUES ...`
+- 标识符支持不加引号，或使用双引号/反引号（例如 `"my_table"`、`` `my_table` ``）。
 
 ## Rust 用法（详细）
 
