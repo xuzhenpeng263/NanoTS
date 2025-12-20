@@ -218,6 +218,14 @@ fn parse_sql_column_type(ty: &str) -> Option<ColumnType> {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 fn coerce_value_for_type(value: Value, col_type: ColumnType) -> io::Result<Value> {
     match (value, col_type) {
         (Value::Null, _) => Ok(Value::Null),
@@ -822,18 +830,22 @@ impl NanoTsDb {
         end_ms: i64,
         predicates: &[ColumnPredicate],
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
+        let effective_start = match self.retention_cutoff_ms() {
+            Some(cutoff) => start_ms.max(cutoff),
+            None => start_ms,
+        };
         let schema = self.storage.read_table_schema(table)?;
         let mut out = self.storage.read_table_columns_in_range_filtered(
             table,
             &schema,
-            start_ms,
+            effective_start,
             end_ms,
             predicates,
         )?;
 
         if let Some(buf) = self.tables.get(table) {
             for r in &buf.rows {
-                if r.ts_ms < start_ms || r.ts_ms > end_ms {
+                if r.ts_ms < effective_start || r.ts_ms > end_ms {
                     continue;
                 }
                 out.0.push(r.ts_ms);
@@ -889,6 +901,11 @@ impl NanoTsDb {
             }
         }
         Ok((ts_sorted, cols_sorted))
+    }
+
+    fn retention_cutoff_ms(&self) -> Option<i64> {
+        let retention_ms = self.meta.retention_ms?;
+        Some(now_ms().saturating_sub(retention_ms))
     }
 
     fn execute_create_table(&mut self, sql: &str) -> io::Result<()> {
@@ -1080,12 +1097,7 @@ impl NanoTsDb {
             Some(ms) => ms,
             None => return Ok(()),
         };
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_millis()
-            .min(i64::MAX as u128) as i64;
-        let cutoff = now_ms.saturating_sub(retention_ms);
+        let cutoff = now_ms().saturating_sub(retention_ms);
         self.compact_retention(cutoff)
     }
 

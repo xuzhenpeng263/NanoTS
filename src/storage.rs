@@ -2220,27 +2220,74 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
 fn rewrite_db_without_table(path: &Path, table: &str) -> io::Result<PathBuf> {
     let tmp = dbfile::temp_db_path(path, "pack");
     dbfile::create_new_db_file(&tmp)?;
+    let mut latest_meta: Option<Vec<u8>> = None;
+    let mut latest_schemas: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut latest_indexes: HashMap<String, Vec<u8>> = HashMap::new();
+
     dbfile::iter_records(path, |hdr, payload| {
-        if hdr.record_type == dbfile::RECORD_TABLE_SEGMENT {
-            let (name, _) = decode_name_prefix(payload)?;
-            if name == table {
-                return Ok(());
+        match hdr.record_type {
+            dbfile::RECORD_SCHEMA => {
+                let (name, _) = decode_name_prefix(payload)?;
+                latest_schemas.insert(name, payload.to_vec());
+            }
+            dbfile::RECORD_META => {
+                latest_meta = Some(payload.to_vec());
+            }
+            dbfile::RECORD_TABLE_INDEX => {
+                let (name, _) = decode_name_prefix(payload)?;
+                if name != table {
+                    latest_indexes.insert(name, payload.to_vec());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    if !latest_schemas.is_empty() {
+        let mut names: Vec<String> = latest_schemas.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            if let Some(payload) = latest_schemas.get(&name) {
+                dbfile::append_record(&tmp, dbfile::RECORD_SCHEMA, payload)?;
             }
         }
-        if hdr.record_type == dbfile::RECORD_TABLE_INDEX {
-            let (name, _) = decode_name_prefix(payload)?;
-            if name == table {
+    }
+
+    dbfile::iter_records(path, |hdr, payload| {
+        match hdr.record_type {
+            dbfile::RECORD_TABLE_SEGMENT => {
+                let (name, _) = decode_name_prefix(payload)?;
+                if name == table {
+                    return Ok(());
+                }
+            }
+            dbfile::RECORD_SCHEMA
+            | dbfile::RECORD_META
+            | dbfile::RECORD_TABLE_INDEX
+            | dbfile::RECORD_FOOTER
+            | dbfile::RECORD_WAL
+            | dbfile::RECORD_WAL_CHECKPOINT => {
                 return Ok(());
             }
-        }
-        if hdr.record_type == dbfile::RECORD_WAL
-            || hdr.record_type == dbfile::RECORD_WAL_CHECKPOINT
-        {
-            return Ok(());
+            _ => {}
         }
         dbfile::append_record(&tmp, hdr.record_type, payload)?;
         Ok(())
     })?;
+
+    if let Some(payload) = latest_meta {
+        dbfile::append_record(&tmp, dbfile::RECORD_META, &payload)?;
+    }
+    if !latest_indexes.is_empty() {
+        let mut names: Vec<String> = latest_indexes.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            if let Some(payload) = latest_indexes.get(&name) {
+                dbfile::append_record(&tmp, dbfile::RECORD_TABLE_INDEX, payload)?;
+            }
+        }
+    }
     Ok(tmp)
 }
 
