@@ -312,6 +312,20 @@ pub fn read_footer_offset(path: &Path) -> io::Result<u64> {
     Ok(offset)
 }
 
+pub fn find_last_footer_offset(path: &Path) -> io::Result<Option<u64>> {
+    let mut last: Option<u64> = None;
+    let res = iter_records(path, |hdr, _| {
+        if hdr.record_type == RECORD_FOOTER {
+            last = Some(hdr.record_offset);
+        }
+        Ok(())
+    });
+    match res {
+        Ok(()) => Ok(last),
+        Err(_) => Ok(last),
+    }
+}
+
 pub fn write_footer_offset(path: &Path, footer_offset: u64) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     file.seek(SeekFrom::Start(5))?;

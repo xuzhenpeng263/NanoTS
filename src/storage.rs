@@ -4,7 +4,7 @@ use crate::compressor::TimeSeriesCompressor;
 use crate::compressor::{compress_f64_xor, decompress_f64_xor};
 use crate::db::{ColumnData, ColumnPredicate, ColumnPredicateOp, ColumnPredicateValue, ColumnSchema, ColumnType, Point, TableSchema};
 use crate::dbfile;
-use memmap2::MmapOptions;
+use memmap2::{Advice, MmapOptions};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -33,6 +33,7 @@ const TABLE_INDEX_VERSION: u8 = 1;
 
 const FOOTER_MAGIC: &[u8; 4] = b"NTSF";
 const FOOTER_VERSION: u8 = 1;
+const UTF8_DISTINCT_LIMIT: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -456,6 +457,7 @@ impl Storage {
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let _ = mmap.advise(Advice::Sequential);
 
         let mut out_ts: Vec<i64> = Vec::new();
         let mut out_cols: Vec<ColumnData> = schema
@@ -497,6 +499,11 @@ impl Storage {
                 if t < start_ms || t > end_ms {
                     continue;
                 }
+                if !mapped_predicates.is_empty()
+                    && !row_matches_predicates(&mapped_predicates, &seg.cols, i)
+                {
+                    continue;
+                }
                 out_ts.push(t);
                 for (cidx, col) in seg.cols.iter().enumerate() {
                     match (&mut out_cols[cidx], col) {
@@ -526,6 +533,146 @@ impl Storage {
         self.pack_table_with_cutoff(table, target_segment_points, None)
     }
 
+    pub fn pack_table_tiered(
+        &self,
+        table: &str,
+        target_segment_points: usize,
+        max_segments_per_pack: usize,
+    ) -> io::Result<()> {
+        let schema = self.read_table_schema(table)?;
+        let index = self.load_or_rebuild_table_index(table)?;
+        if index.is_empty() {
+            return Ok(());
+        }
+        let file = File::open(&self.path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let _ = mmap.advise(Advice::Sequential);
+        let tmp = rewrite_db_without_table(&self.path, table)?;
+
+        let mut acc_ts: Vec<i64> = Vec::new();
+        let mut acc_cols: Vec<ColumnData> = schema
+            .columns
+            .iter()
+            .map(|col| match col.col_type {
+                ColumnType::F64 => ColumnData::F64(Vec::new()),
+                ColumnType::I64 => ColumnData::I64(Vec::new()),
+                ColumnType::Bool => ColumnData::Bool(Vec::new()),
+                ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+            })
+            .collect();
+        let mut acc_min_seq: u64 = 0;
+        let mut acc_max_seq: u64 = 0;
+        let mut packed_segments = 0usize;
+
+        let flush_acc = |acc_ts: &mut Vec<i64>,
+                         acc_cols: &mut Vec<ColumnData>,
+                         acc_min_seq: u64,
+                         acc_max_seq: u64|
+         -> io::Result<bool> {
+            if acc_ts.is_empty() {
+                return Ok(false);
+            }
+            let bytes = encode_table_segment(&schema, acc_ts, acc_cols, acc_min_seq, acc_max_seq)?;
+            if !bytes.is_empty() {
+                let payload = encode_named_payload(table, &bytes)?;
+                dbfile::append_record(&tmp, dbfile::RECORD_TABLE_SEGMENT, &payload)?;
+            }
+            acc_ts.clear();
+            for c in acc_cols {
+                match c {
+                    ColumnData::F64(v) => v.clear(),
+                    ColumnData::I64(v) => v.clear(),
+                    ColumnData::Bool(v) => v.clear(),
+                    ColumnData::Utf8(v) => v.clear(),
+                }
+            }
+            Ok(true)
+        };
+
+        let copy_segment = |e: &TableIndexEntry| -> io::Result<()> {
+            let off = e.offset as usize;
+            let end = off.saturating_add(e.len as usize);
+            if end > mmap.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "table index range out of bounds",
+                ));
+            }
+            verify_table_segment_checksum(&mmap, table, e)?;
+            let payload = encode_named_payload(table, &mmap[off..end])?;
+            dbfile::append_record(&tmp, dbfile::RECORD_TABLE_SEGMENT, &payload)?;
+            Ok(())
+        };
+
+        for e in index {
+            if packed_segments >= max_segments_per_pack {
+                if flush_acc(&mut acc_ts, &mut acc_cols, acc_min_seq, acc_max_seq)? {
+                    packed_segments = packed_segments.saturating_add(1);
+                }
+                copy_segment(&e)?;
+                continue;
+            }
+            if e.count as usize >= target_segment_points {
+                if flush_acc(&mut acc_ts, &mut acc_cols, acc_min_seq, acc_max_seq)? {
+                    packed_segments = packed_segments.saturating_add(1);
+                }
+                copy_segment(&e)?;
+                continue;
+            }
+
+            let off = e.offset as usize;
+            let end = off.saturating_add(e.len as usize);
+            if end > mmap.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "table index range out of bounds",
+                ));
+            }
+            verify_table_segment_checksum(&mmap, table, &e)?;
+            let seg = read_table_segment_from_bytes(&mmap[off..end], &schema)?;
+
+            for i in 0..seg.ts_ms.len() {
+                let t = seg.ts_ms[i];
+                if acc_ts.is_empty() {
+                    acc_min_seq = seg.min_seq;
+                }
+                acc_max_seq = seg.max_seq;
+                acc_ts.push(t);
+                for (cidx, col) in seg.cols.iter().enumerate() {
+                    match (&mut acc_cols[cidx], col) {
+                        (ColumnData::F64(dst), ColumnData::F64(src)) => dst.push(src[i]),
+                        (ColumnData::I64(dst), ColumnData::I64(src)) => dst.push(src[i]),
+                        (ColumnData::Bool(dst), ColumnData::Bool(src)) => dst.push(src[i]),
+                        (ColumnData::Utf8(dst), ColumnData::Utf8(src)) => dst.push(src[i].clone()),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "column type mismatch",
+                            ))
+                        }
+                    }
+                }
+
+                if acc_ts.len() >= target_segment_points {
+                    if flush_acc(&mut acc_ts, &mut acc_cols, acc_min_seq, acc_max_seq)? {
+                        packed_segments = packed_segments.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        let _ = flush_acc(&mut acc_ts, &mut acc_cols, acc_min_seq, acc_max_seq)?;
+
+        drop(mmap);
+        drop(file);
+        std::fs::rename(&tmp, &self.path)?;
+        let new_state = scan_db_file(&self.path)?;
+        *self.state.lock().unwrap() = new_state;
+        self.write_table_index(table)?;
+        self.write_footer()?;
+        Ok(())
+    }
+
     fn pack_table_with_cutoff(
         &self,
         table: &str,
@@ -539,6 +686,7 @@ impl Storage {
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let _ = mmap.advise(Advice::Sequential);
 
         let mut acc_ts: Vec<i64> = Vec::new();
         let mut acc_cols: Vec<ColumnData> = schema
@@ -627,6 +775,8 @@ impl Storage {
             }
         }
 
+        drop(mmap);
+        drop(file);
         std::fs::rename(&tmp, &self.path)?;
         let new_state = scan_db_file(&self.path)?;
         *self.state.lock().unwrap() = new_state;
@@ -799,7 +949,7 @@ enum ColumnStats {
     F64 { min: f64, max: f64 },
     I64 { min: i64, max: i64 },
     Bool { min: bool, max: bool },
-    Utf8 { min_len: u32, max_len: u32 },
+    Utf8 { min_len: u32, max_len: u32, distinct: Option<Vec<String>> },
 }
 
 #[derive(Debug)]
@@ -1271,6 +1421,8 @@ fn stats_bool(values: &[Option<bool>]) -> Option<ColumnStats> {
 fn stats_utf8(values: &[Option<String>]) -> Option<ColumnStats> {
     let mut min: Option<u32> = None;
     let mut max: Option<u32> = None;
+    let mut distinct: Vec<String> = Vec::new();
+    let mut distinct_truncated = false;
     for v in values {
         let s = match v {
             Some(s) => s,
@@ -1289,9 +1441,26 @@ fn stats_utf8(values: &[Option<String>]) -> Option<ColumnStats> {
             Some(cur) => cur.max(len),
             None => len,
         });
+        if !distinct_truncated {
+            if !distinct.iter().any(|v| v == s) {
+                if distinct.len() >= UTF8_DISTINCT_LIMIT {
+                    distinct_truncated = true;
+                } else {
+                    distinct.push(s.clone());
+                }
+            }
+        }
     }
-    min.zip(max)
-        .map(|(min_len, max_len)| ColumnStats::Utf8 { min_len, max_len })
+    let distinct = if distinct_truncated || distinct.is_empty() {
+        None
+    } else {
+        Some(distinct)
+    };
+    min.zip(max).map(|(min_len, max_len)| ColumnStats::Utf8 {
+        min_len,
+        max_len,
+        distinct,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1317,6 +1486,7 @@ fn map_predicates(schema: &TableSchema, predicates: &[ColumnPredicate]) -> Vec<M
             (ColumnPredicateValue::F64(_), ColumnType::F64) => true,
             (ColumnPredicateValue::I64(_), ColumnType::I64) => true,
             (ColumnPredicateValue::Bool(_), ColumnType::Bool) => true,
+            (ColumnPredicateValue::Utf8(_), ColumnType::Utf8) => true,
             _ => false,
         };
         if !matches {
@@ -1350,6 +1520,63 @@ fn entry_may_match_predicates(entry: &TableIndexEntry, preds: &[MappedPredicate]
             }
             (ColumnStats::Bool { min, max }, ColumnPredicateValue::Bool(v)) => {
                 bool_range_may_match(*min, *max, *v, pred.op)
+            }
+            (ColumnStats::Utf8 { distinct, .. }, ColumnPredicateValue::Utf8(v)) => {
+                match pred.op {
+                    ColumnPredicateOp::Eq => distinct
+                        .as_ref()
+                        .map(|vals| vals.iter().any(|s| s == v))
+                        .unwrap_or(true),
+                    _ => true,
+                }
+            }
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn row_matches_predicates(preds: &[MappedPredicate], cols: &[ColumnData], row: usize) -> bool {
+    for pred in preds {
+        let ok = match (&cols[pred.col_idx], &pred.value) {
+            (ColumnData::F64(values), ColumnPredicateValue::F64(v)) => {
+                values.get(row).and_then(|v| *v).map_or(false, |val| match pred.op {
+                    ColumnPredicateOp::Eq => val == *v,
+                    ColumnPredicateOp::Gt => val > *v,
+                    ColumnPredicateOp::GtEq => val >= *v,
+                    ColumnPredicateOp::Lt => val < *v,
+                    ColumnPredicateOp::LtEq => val <= *v,
+                })
+            }
+            (ColumnData::I64(values), ColumnPredicateValue::I64(v)) => {
+                values.get(row).and_then(|v| *v).map_or(false, |val| match pred.op {
+                    ColumnPredicateOp::Eq => val == *v,
+                    ColumnPredicateOp::Gt => val > *v,
+                    ColumnPredicateOp::GtEq => val >= *v,
+                    ColumnPredicateOp::Lt => val < *v,
+                    ColumnPredicateOp::LtEq => val <= *v,
+                })
+            }
+            (ColumnData::Bool(values), ColumnPredicateValue::Bool(v)) => {
+                values.get(row).and_then(|v| *v).map_or(false, |val| match pred.op {
+                    ColumnPredicateOp::Eq => val == *v,
+                    ColumnPredicateOp::Gt => (val as u8) > (*v as u8),
+                    ColumnPredicateOp::GtEq => (val as u8) >= (*v as u8),
+                    ColumnPredicateOp::Lt => (val as u8) < (*v as u8),
+                    ColumnPredicateOp::LtEq => (val as u8) <= (*v as u8),
+                })
+            }
+            (ColumnData::Utf8(values), ColumnPredicateValue::Utf8(v)) => {
+                values.get(row).and_then(|v| v.as_ref()).map_or(false, |val| match pred.op {
+                    ColumnPredicateOp::Eq => val == v,
+                    ColumnPredicateOp::Gt => val > v,
+                    ColumnPredicateOp::GtEq => val >= v,
+                    ColumnPredicateOp::Lt => val < v,
+                    ColumnPredicateOp::LtEq => val <= v,
+                })
             }
             _ => true,
         };
@@ -2074,12 +2301,35 @@ fn encode_table_index_payload(
                     out.push(max);
                 }
                 ColumnType::Utf8 => {
-                    let (min_len, max_len) = match stats {
-                        Some(ColumnStats::Utf8 { min_len, max_len }) => (*min_len, *max_len),
-                        _ => (0, 0),
+                    let (min_len, max_len, distinct) = match stats {
+                        Some(ColumnStats::Utf8 { min_len, max_len, distinct }) => {
+                            (*min_len, *max_len, distinct.as_ref())
+                        }
+                        _ => (0, 0, None),
                     };
                     out.extend_from_slice(&min_len.to_le_bytes());
                     out.extend_from_slice(&max_len.to_le_bytes());
+                    let distinct_len = distinct.map(|v| v.len()).unwrap_or(0);
+                    if distinct_len > u16::MAX as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "distinct utf8 values exceed u16::MAX",
+                        ));
+                    }
+                    out.extend_from_slice(&(distinct_len as u16).to_le_bytes());
+                    if let Some(values) = distinct {
+                        for value in values {
+                            let bytes = value.as_bytes();
+                            if bytes.len() > u16::MAX as usize {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "distinct utf8 value too long",
+                                ));
+                            }
+                            out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                            out.extend_from_slice(bytes);
+                        }
+                    }
                 }
             }
         }
@@ -2156,8 +2406,27 @@ fn decode_table_index_payload(
                 ColumnType::Utf8 => {
                     let min_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap());
                     let max_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap());
+                    let count = u16::from_le_bytes(read_exact(2)?.try_into().unwrap()) as usize;
+                    let distinct = if count == 0 {
+                        None
+                    } else {
+                        let mut values = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            let len = u16::from_le_bytes(read_exact(2)?.try_into().unwrap()) as usize;
+                            let bytes = read_exact(len)?.to_vec();
+                            let s = String::from_utf8(bytes).map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "bad utf8 distinct")
+                            })?;
+                            values.push(s);
+                        }
+                        Some(values)
+                    };
                     if has_stats {
-                        Some(ColumnStats::Utf8 { min_len, max_len })
+                        Some(ColumnStats::Utf8 {
+                            min_len,
+                            max_len,
+                            distinct,
+                        })
                     } else {
                         None
                     }
@@ -2180,13 +2449,26 @@ fn decode_table_index_payload(
 }
 
 fn load_state_from_footer(path: &Path) -> io::Result<Option<StorageState>> {
-    let footer_offset = dbfile::read_footer_offset(path)?;
+    let mut footer_offset = dbfile::read_footer_offset(path)?;
     if footer_offset == 0 {
-        return Ok(None);
+        if let Some(fallback) = dbfile::find_last_footer_offset(path)? {
+            footer_offset = fallback;
+        } else {
+            return Ok(None);
+        }
     }
     let (footer_hdr, footer_payload) = match dbfile::read_record_at(path, footer_offset) {
         Ok(v) => v,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            if let Some(fallback) = dbfile::find_last_footer_offset(path)? {
+                match dbfile::read_record_at(path, fallback) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                return Ok(None);
+            }
+        }
     };
     if footer_hdr.record_type != dbfile::RECORD_FOOTER {
         return Ok(None);

@@ -201,6 +201,24 @@ df = batch.to_pandas()  # 在 Arrow 侧尽可能零拷贝
 print(df.head())
 ```
 
+### Arrow 批量写入（来自 PyArrow）
+
+```python
+import nanots
+import pyarrow as pa
+
+db = nanots.Db("./my_db.ntt")
+batch = pa.record_batch(
+    [
+        pa.array([1000, 1001, 1002], type=pa.int64()),
+        pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+    ],
+    names=["ts_ms", "value"],
+)
+schema_capsule, array_capsule = batch.__arrow_c_array__()
+db.append_rows_arrow_capsules("sensor", schema_capsule, array_capsule)
+```
+
 ### Stats（空间统计与 codec 验证）
 
 ```python

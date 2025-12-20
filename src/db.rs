@@ -41,6 +41,8 @@ pub struct AutoMaintenanceOptions {
     pub target_segment_points: usize,
     pub max_writes_per_sec: u64,
     pub write_load_window: Duration,
+    pub min_idle_time: Duration,
+    pub max_segments_per_pack: usize,
 }
 
 impl Default for AutoMaintenanceOptions {
@@ -53,6 +55,8 @@ impl Default for AutoMaintenanceOptions {
             target_segment_points: 8192,
             max_writes_per_sec: 100_000,
             write_load_window: Duration::from_secs(5),
+            min_idle_time: Duration::from_secs(1),
+            max_segments_per_pack: 64,
         }
     }
 }
@@ -115,6 +119,7 @@ pub enum ColumnPredicateValue {
     F64(f64),
     I64(i64),
     Bool(bool),
+    Utf8(String),
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +138,24 @@ pub struct ColumnSchema {
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub columns: Vec<ColumnSchema>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DbDiagnostics {
+    pub wal_bytes: u64,
+    pub total_table_segment_bytes: u64,
+    pub wal_ratio: Option<f64>,
+    pub pending_rows: u64,
+    pub pending_tables: u64,
+    pub writes_per_sec: u64,
+    pub last_write_age_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MappedPredicate {
+    col_idx: usize,
+    op: ColumnPredicateOp,
+    value: ColumnPredicateValue,
 }
 
 impl TableSchema {
@@ -200,6 +223,80 @@ fn init_column_buffers(schema: &TableSchema, capacity: usize) -> Vec<ColumnData>
             ColumnType::Utf8 => ColumnData::Utf8(Vec::with_capacity(capacity)),
         })
         .collect()
+}
+
+fn map_predicates_for_schema(
+    schema: &TableSchema,
+    predicates: &[ColumnPredicate],
+) -> Vec<MappedPredicate> {
+    let mut out = Vec::new();
+    for pred in predicates {
+        let idx = match schema
+            .columns
+            .iter()
+            .position(|c| c.name == pred.column)
+        {
+            Some(idx) => idx,
+            None => continue,
+        };
+        let col_type = schema.columns[idx].col_type;
+        let matches = match (&pred.value, col_type) {
+            (ColumnPredicateValue::F64(_), ColumnType::F64) => true,
+            (ColumnPredicateValue::I64(_), ColumnType::I64) => true,
+            (ColumnPredicateValue::Bool(_), ColumnType::Bool) => true,
+            (ColumnPredicateValue::Utf8(_), ColumnType::Utf8) => true,
+            _ => false,
+        };
+        if !matches {
+            continue;
+        }
+        out.push(MappedPredicate {
+            col_idx: idx,
+            op: pred.op,
+            value: pred.value.clone(),
+        });
+    }
+    out
+}
+
+fn row_matches_predicates(values: &[Value], preds: &[MappedPredicate]) -> bool {
+    for pred in preds {
+        let ok = match (values.get(pred.col_idx), &pred.value) {
+            (Some(Value::F64(v)), ColumnPredicateValue::F64(p)) => match pred.op {
+                ColumnPredicateOp::Eq => v == p,
+                ColumnPredicateOp::Gt => v > p,
+                ColumnPredicateOp::GtEq => v >= p,
+                ColumnPredicateOp::Lt => v < p,
+                ColumnPredicateOp::LtEq => v <= p,
+            },
+            (Some(Value::I64(v)), ColumnPredicateValue::I64(p)) => match pred.op {
+                ColumnPredicateOp::Eq => v == p,
+                ColumnPredicateOp::Gt => v > p,
+                ColumnPredicateOp::GtEq => v >= p,
+                ColumnPredicateOp::Lt => v < p,
+                ColumnPredicateOp::LtEq => v <= p,
+            },
+            (Some(Value::Bool(v)), ColumnPredicateValue::Bool(p)) => match pred.op {
+                ColumnPredicateOp::Eq => v == p,
+                ColumnPredicateOp::Gt => (*v as u8) > (*p as u8),
+                ColumnPredicateOp::GtEq => (*v as u8) >= (*p as u8),
+                ColumnPredicateOp::Lt => (*v as u8) < (*p as u8),
+                ColumnPredicateOp::LtEq => (*v as u8) <= (*p as u8),
+            },
+            (Some(Value::Utf8(v)), ColumnPredicateValue::Utf8(p)) => match pred.op {
+                ColumnPredicateOp::Eq => v == p,
+                ColumnPredicateOp::Gt => v > p,
+                ColumnPredicateOp::GtEq => v >= p,
+                ColumnPredicateOp::Lt => v < p,
+                ColumnPredicateOp::LtEq => v <= p,
+            },
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 fn to_wal_value(value: &Value) -> WalValue<'_> {
@@ -469,6 +566,7 @@ pub struct NanoTsDb {
 struct WriteStats {
     window_start: Instant,
     writes: u64,
+    last_write: Instant,
 }
 
 #[derive(Clone)]
@@ -543,6 +641,7 @@ impl NanoTsDb {
             write_stats: WriteStats {
                 window_start: Instant::now(),
                 writes: 0,
+                last_write: Instant::now(),
             },
         };
 
@@ -651,6 +750,7 @@ impl NanoTsDb {
             self.write_stats.writes = 0;
         }
         self.write_stats.writes = self.write_stats.writes.saturating_add(1);
+        self.write_stats.last_write = Instant::now();
     }
 
     pub fn append_row(&mut self, table: &str, ts_ms: i64, values: &[f64]) -> io::Result<u64> {
@@ -863,6 +963,7 @@ impl NanoTsDb {
             None => start_ms,
         };
         let schema = self.storage.read_table_schema(table)?;
+        let mapped_predicates = map_predicates_for_schema(&schema, predicates);
         let mut out = self.storage.read_table_columns_in_range_filtered(
             table,
             &schema,
@@ -874,6 +975,10 @@ impl NanoTsDb {
         if let Some(buf) = self.tables.get(table) {
             for r in &buf.rows {
                 if r.ts_ms < effective_start || r.ts_ms > end_ms {
+                    continue;
+                }
+                if !mapped_predicates.is_empty() && !row_matches_predicates(&r.values, &mapped_predicates)
+                {
                     continue;
                 }
                 out.0.push(r.ts_ms);
@@ -1108,6 +1213,47 @@ impl NanoTsDb {
 
     pub fn list_tables(&self) -> io::Result<Vec<String>> {
         self.storage.list_tables()
+    }
+
+    pub fn diagnose(&self) -> io::Result<DbDiagnostics> {
+        let total_table_segment_bytes = self.storage.total_table_segment_bytes()?;
+        let wal_ratio = if total_table_segment_bytes > 0 {
+            Some(self.wal_bytes as f64 / total_table_segment_bytes as f64)
+        } else {
+            None
+        };
+        let pending_rows = self
+            .tables
+            .values()
+            .map(|buf| buf.rows.len() as u64)
+            .sum::<u64>();
+        let pending_tables = self
+            .tables
+            .values()
+            .filter(|buf| !buf.rows.is_empty())
+            .count() as u64;
+        let elapsed = self.write_stats.window_start.elapsed();
+        let writes_per_sec = if elapsed.as_millis() == 0 {
+            0
+        } else {
+            (self.write_stats.writes as u128 * 1000 / elapsed.as_millis())
+                .min(u64::MAX as u128) as u64
+        };
+        let last_write_age_ms = self
+            .write_stats
+            .last_write
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        Ok(DbDiagnostics {
+            wal_bytes: self.wal_bytes,
+            total_table_segment_bytes,
+            wal_ratio,
+            pending_rows,
+            pending_tables,
+            writes_per_sec,
+            last_write_age_ms,
+        })
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -1385,6 +1531,19 @@ impl NanoTsDb {
         Ok(())
     }
 
+    fn pack_all_tables_tiered(
+        &mut self,
+        target_segment_points: usize,
+        max_segments_per_pack: usize,
+    ) -> io::Result<()> {
+        self.flush()?;
+        for table in self.storage.list_tables()? {
+            self.storage
+                .pack_table_tiered(&table, target_segment_points, max_segments_per_pack)?;
+        }
+        Ok(())
+    }
+
     fn should_auto_pack(&self, opts: &AutoMaintenanceOptions) -> io::Result<bool> {
         if self.wal_bytes < opts.wal_min_bytes {
             return Ok(false);
@@ -1407,6 +1566,10 @@ impl NanoTsDb {
         let writes_per_sec = (self.write_stats.writes as u128 * 1000 / elapsed.as_millis())
             .min(u64::MAX as u128) as u64;
         writes_per_sec >= opts.max_writes_per_sec
+    }
+
+    fn idle_for_pack(&self, opts: &AutoMaintenanceOptions) -> bool {
+        self.write_stats.last_write.elapsed() >= opts.min_idle_time
     }
 }
 
@@ -1432,8 +1595,8 @@ fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptio
                 Ok(should_pack) => should_pack,
                 Err(_) => continue,
             };
-            if should_pack && !guard.write_load_high(&opts) {
-                let _ = guard.pack_all_tables(opts.target_segment_points);
+            if should_pack && !guard.write_load_high(&opts) && guard.idle_for_pack(&opts) {
+                let _ = guard.pack_all_tables_tiered(opts.target_segment_points, opts.max_segments_per_pack);
             }
         }
     });
@@ -1866,6 +2029,74 @@ mod tests {
         let (ts, cols) = db.query_table_range_columns("t", 0, 10_000).unwrap();
         assert_eq!(ts.len(), cols[0].len());
         assert!(ts.len() >= 100);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_query_predicates_filter_rows() {
+        let path = fresh_db_path("predicates");
+        let opts = NanoTsOptions::default();
+        {
+            let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
+            db.create_table_typed(
+                "t",
+                &[
+                    ("i", ColumnType::I64),
+                    ("b", ColumnType::Bool),
+                    ("s", ColumnType::Utf8),
+                ],
+            )
+            .unwrap();
+            db.append_row_typed(
+                "t",
+                1000,
+                &[
+                    Value::I64(1),
+                    Value::Bool(true),
+                    Value::Utf8("a".to_string()),
+                ],
+            )
+            .unwrap();
+            db.append_row_typed(
+                "t",
+                1001,
+                &[
+                    Value::I64(2),
+                    Value::Bool(false),
+                    Value::Utf8("b".to_string()),
+                ],
+            )
+            .unwrap();
+            db.flush().unwrap();
+        }
+        let db = NanoTsDb::open(&path, opts).unwrap();
+        let preds = vec![ColumnPredicate {
+            column: "b".to_string(),
+            op: ColumnPredicateOp::Eq,
+            value: ColumnPredicateValue::Bool(true),
+        }];
+        let (ts, cols) = db
+            .query_table_range_typed_with_predicates("t", 0, 10_000, &preds)
+            .unwrap();
+        assert_eq!(ts, vec![1000]);
+        match &cols[0] {
+            ColumnData::I64(values) => assert_eq!(values[0], Some(1)),
+            _ => panic!("unexpected column type"),
+        }
+
+        let preds = vec![ColumnPredicate {
+            column: "s".to_string(),
+            op: ColumnPredicateOp::Eq,
+            value: ColumnPredicateValue::Utf8("b".to_string()),
+        }];
+        let (ts, cols) = db
+            .query_table_range_typed_with_predicates("t", 0, 10_000, &preds)
+            .unwrap();
+        assert_eq!(ts, vec![1001]);
+        match &cols[2] {
+            ColumnData::Utf8(values) => assert_eq!(values[0].as_deref(), Some("b")),
+            _ => panic!("unexpected column type"),
+        }
         let _ = fs::remove_file(path);
     }
 }

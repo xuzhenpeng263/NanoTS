@@ -16,15 +16,11 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
 use datafusion::scalar::ScalarValue;
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::task;
 
 pub fn query_sql(db: Arc<NanoTsDb>, sql: &str) -> DFResult<Vec<RecordBatch>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| DataFusionError::Execution(format!("tokio runtime build failed: {e}")))?;
-
+    let rt = runtime()?;
     rt.block_on(async move {
         let ctx = SessionContext::new();
         register_udfs(&ctx)?;
@@ -32,6 +28,19 @@ pub fn query_sql(db: Arc<NanoTsDb>, sql: &str) -> DFResult<Vec<RecordBatch>> {
         let df = ctx.sql(sql).await?;
         df.collect().await
     })
+}
+
+fn runtime() -> DFResult<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime build failed: {e}"))
+    }) {
+        Ok(rt) => Ok(rt),
+        Err(msg) => Err(DataFusionError::Execution(msg.clone())),
+    }
 }
 
 fn register_all_tables(db: Arc<NanoTsDb>, ctx: &SessionContext) -> DFResult<()> {
@@ -516,6 +525,7 @@ fn scalar_to_predicate_value(value: &ScalarValue) -> Option<ColumnPredicateValue
             .map(ColumnPredicateValue::I64),
         ScalarValue::UInt32(Some(v)) => Some(ColumnPredicateValue::I64(*v as i64)),
         ScalarValue::Boolean(Some(v)) => Some(ColumnPredicateValue::Bool(*v)),
+        ScalarValue::Utf8(Some(v)) => Some(ColumnPredicateValue::Utf8(v.clone())),
         _ => None,
     }
 }

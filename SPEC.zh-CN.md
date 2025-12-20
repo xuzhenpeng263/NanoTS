@@ -12,6 +12,10 @@
 - `version`：u8 = `1`
 - `footer_offset`：u64（`0` 表示无 footer）
 
+说明：
+
+- 读取时如 `footer_offset` 为 `0` 或无效，可回退为扫描文件并选择最后一个有效的 Footer 记录。
+
 文件头之后是连续的**记录（record）**：
 
 记录头：
@@ -222,4 +226,8 @@ Header：
   - 列为 `F64`：`min`: f64，`max`: f64
   - 列为 `I64`：`min`: i64，`max`: i64
   - 列为 `Bool`：`min`: u8，`max`: u8
-  - 列为 `Utf8`：`min_len`: u32，`max_len`: u32
+  - 列为 `Utf8`：
+    - `min_len`: u32，`max_len`: u32
+    - `distinct_count`: u16，接着重复 `distinct_count` 次：
+      - `value_len`: u16
+      - `value_bytes`: `value_len` bytes（UTF-8）

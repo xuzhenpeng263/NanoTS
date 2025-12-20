@@ -32,6 +32,25 @@ schema_capsule, array_capsule = db.query_table_range_arrow_capsules("sensor", t1
 batch = pyarrow.lib.RecordBatch._import_from_c_capsule(schema_capsule, array_capsule)
 ```
 
+## Arrow batch append
+
+```python
+import pyarrow as pa
+import nanots
+
+db = nanots.Db("data/test.ntt")
+
+batch = pa.record_batch(
+    [
+        pa.array([1000, 1001, 1002], type=pa.int64()),
+        pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+    ],
+    names=["ts_ms", "value"],
+)
+schema_capsule, array_capsule = batch.__arrow_c_array__()
+db.append_rows_arrow_capsules("sensor", schema_capsule, array_capsule)
+```
+
 ## Auto maintenance options
 
 ```python
@@ -45,8 +64,19 @@ db = nanots.Db(
         "retention_check_interval_ms": 60000,
         "max_writes_per_sec": 100000,
         "write_load_window_ms": 5000,
+        "min_idle_ms": 1000,
+        "max_segments_per_pack": 64,
     },
 )
+```
+
+## Diagnose
+
+```python
+import nanots
+
+db = nanots.Db("data/test.ntt")
+print(db.diagnose())
 ```
 
 ## Power loss simulation

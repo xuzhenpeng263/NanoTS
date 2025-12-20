@@ -6,8 +6,17 @@ use nanots_core::{NanoTsDb, NanoTsOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyString};
+#[cfg(feature = "arrow")]
+use pyo3::types::PyCapsule;
 use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(feature = "arrow")]
+use std::ffi::c_void;
+
+#[cfg(feature = "arrow")]
+use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, StructArray};
+#[cfg(feature = "arrow")]
+use arrow::ffi::{self, FFI_ArrowArray, FFI_ArrowSchema};
 
 #[pyclass]
 struct Db {
@@ -229,6 +238,141 @@ impl Db {
         Ok((schema_capsule, array_capsule))
     }
 
+    /// Append a batch from Arrow C Data Interface capsules.
+    /// Accepts (schema_capsule, array_capsule) like PyArrow's `__arrow_c_array__`.
+    #[cfg(feature = "arrow")]
+    fn append_rows_arrow_capsules(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        schema_capsule: PyObject,
+        array_capsule: PyObject,
+    ) -> PyResult<u64> {
+        let schema_capsule = schema_capsule.bind(py).downcast::<PyCapsule>()?;
+        let array_capsule = array_capsule.bind(py).downcast::<PyCapsule>()?;
+
+        let schema_ptr = capsule_pointer(schema_capsule, "arrow_schema")?;
+        let array_ptr = capsule_pointer(array_capsule, "arrow_array")?;
+        if schema_ptr.is_null() || array_ptr.is_null() {
+            return Err(PyRuntimeError::new_err("null Arrow capsule pointer"));
+        }
+
+        let schema_ptr = schema_ptr.cast::<FFI_ArrowSchema>();
+        let ffi_array = unsafe { FFI_ArrowArray::from_raw(array_ptr.cast()) };
+        let mut array_data = unsafe { ffi::from_ffi(ffi_array, &*schema_ptr) }
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        array_data.align_buffers();
+        let struct_array = StructArray::from(array_data);
+
+        let ts_array = struct_array
+            .column_by_name("ts_ms")
+            .or_else(|| struct_array.column_by_name("ts"))
+            .ok_or_else(|| PyRuntimeError::new_err("missing ts_ms column"))?;
+        let ts_array = ts_array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| PyRuntimeError::new_err("ts_ms must be int64"))?;
+        let mut ts_ms = Vec::with_capacity(ts_array.len());
+        for i in 0..ts_array.len() {
+            if ts_array.is_null(i) {
+                return Err(PyRuntimeError::new_err("ts_ms contains null"));
+            }
+            ts_ms.push(ts_array.value(i));
+        }
+
+        let mut db = self.inner.lock().map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+        let schema = db
+            .table_schema(table)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut columns: Vec<ColumnData> = Vec::with_capacity(schema.columns.len());
+
+        for col in &schema.columns {
+            let array = struct_array
+                .column_by_name(&col.name)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("missing column {}", col.name)))?;
+            let data = match col.col_type {
+                ColumnType::F64 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| PyRuntimeError::new_err("f64 column type mismatch"))?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for i in 0..arr.len() {
+                        out.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+                    }
+                    ColumnData::F64(out)
+                }
+                ColumnType::I64 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| PyRuntimeError::new_err("i64 column type mismatch"))?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for i in 0..arr.len() {
+                        out.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+                    }
+                    ColumnData::I64(out)
+                }
+                ColumnType::Bool => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| PyRuntimeError::new_err("bool column type mismatch"))?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for i in 0..arr.len() {
+                        out.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+                    }
+                    ColumnData::Bool(out)
+                }
+                ColumnType::Utf8 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| PyRuntimeError::new_err("utf8 column type mismatch"))?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for i in 0..arr.len() {
+                        out.push(if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i).to_string())
+                        });
+                    }
+                    ColumnData::Utf8(out)
+                }
+            };
+            columns.push(data);
+        }
+
+        if columns.iter().any(|col| match col {
+            ColumnData::F64(v) => v.len() != ts_ms.len(),
+            ColumnData::I64(v) => v.len() != ts_ms.len(),
+            ColumnData::Bool(v) => v.len() != ts_ms.len(),
+            ColumnData::Utf8(v) => v.len() != ts_ms.len(),
+        }) {
+            return Err(PyRuntimeError::new_err("column length mismatch"));
+        }
+
+        let mut values: Vec<Value> = vec![Value::Null; schema.columns.len()];
+        let mut appended = 0u64;
+        for row in 0..ts_ms.len() {
+            for (cidx, col) in columns.iter().enumerate() {
+                values[cidx] = match col {
+                    ColumnData::F64(v) => v[row].map(Value::F64).unwrap_or(Value::Null),
+                    ColumnData::I64(v) => v[row].map(Value::I64).unwrap_or(Value::Null),
+                    ColumnData::Bool(v) => v[row].map(Value::Bool).unwrap_or(Value::Null),
+                    ColumnData::Utf8(v) => v[row]
+                        .as_ref()
+                        .map(|s| Value::Utf8(s.clone()))
+                        .unwrap_or(Value::Null),
+                };
+            }
+            db.append_row_typed(table, ts_ms[row], &values)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            appended = appended.saturating_add(1);
+        }
+        Ok(appended)
+    }
+
     /// Returns an Arrow C Stream capsule for SQL query results.
     /// Import in Python with `pyarrow.RecordBatchReader._import_from_c_capsule(capsule)`.
     #[cfg(feature = "datafusion")]
@@ -282,7 +426,7 @@ impl Db {
         Ok(stream_capsule)
     }
 
-fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
+    fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
         let db = self
             .inner
             .lock()
@@ -342,6 +486,29 @@ fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
         Ok(d.to_object(py))
     }
 
+    fn diagnose(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let db = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+        let diag = db
+            .diagnose()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let d = PyDict::new(py);
+        d.set_item("wal_bytes", diag.wal_bytes)?;
+        d.set_item("total_table_segment_bytes", diag.total_table_segment_bytes)?;
+        if let Some(ratio) = diag.wal_ratio {
+            d.set_item("wal_ratio", ratio)?;
+        } else {
+            d.set_item("wal_ratio", py.None())?;
+        }
+        d.set_item("pending_rows", diag.pending_rows)?;
+        d.set_item("pending_tables", diag.pending_tables)?;
+        d.set_item("writes_per_sec", diag.writes_per_sec)?;
+        d.set_item("last_write_age_ms", diag.last_write_age_ms)?;
+        Ok(d.to_object(py))
+    }
+
     fn table_time_range(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
         let db = self
             .inner
@@ -398,6 +565,12 @@ fn parse_auto_maintenance(
         if let Ok(Some(v)) = dict.get_item("write_load_window_ms") {
             opts.write_load_window = Duration::from_millis(v.extract::<u64>()?);
         }
+        if let Ok(Some(v)) = dict.get_item("min_idle_ms") {
+            opts.min_idle_time = Duration::from_millis(v.extract::<u64>()?);
+        }
+        if let Ok(Some(v)) = dict.get_item("max_segments_per_pack") {
+            opts.max_segments_per_pack = v.extract::<usize>()?;
+        }
         return Ok(Some(opts));
     }
     Err(PyRuntimeError::new_err(
@@ -414,6 +587,20 @@ fn parse_column_type(ty: &str) -> PyResult<ColumnType> {
         "str" | "string" | "utf8" => Ok(ColumnType::Utf8),
         _ => Err(PyRuntimeError::new_err("unsupported column type")),
     }
+}
+
+#[cfg(feature = "arrow")]
+fn capsule_pointer(capsule: &Bound<'_, PyCapsule>, name: &str) -> PyResult<*mut c_void> {
+    let mut cname = name.as_bytes().to_vec();
+    cname.push(0);
+    let ptr = unsafe { pyo3::ffi::PyCapsule_GetPointer(capsule.as_ptr(), cname.as_ptr() as *const _) };
+    if ptr.is_null() {
+        return Err(PyRuntimeError::new_err(format!(
+            "invalid capsule name: {}",
+            name
+        )));
+    }
+    Ok(ptr)
 }
 
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {

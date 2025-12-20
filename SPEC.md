@@ -12,6 +12,10 @@ The database is a single file (typically `*.ntt`) with this header:
 - `version`: u8 = `1`
 - `footer_offset`: u64 (`0` means no footer)
 
+Notes:
+
+- Readers may fall back to scanning the file for the last valid Footer record if the header `footer_offset` is `0` or invalid.
+
 After the header, the file is a sequence of **records**:
 
 Record header:
@@ -105,7 +109,11 @@ Then repeated `count` times:
   - If column is `F64`: `min`: f64, `max`: f64
   - If column is `I64`: `min`: i64, `max`: i64
   - If column is `Bool`: `min`: u8, `max`: u8
-  - If column is `Utf8`: `min_len`: u32, `max_len`: u32
+  - If column is `Utf8`:
+    - `min_len`: u32, `max_len`: u32
+    - `distinct_count`: u16, then repeated `distinct_count` times:
+      - `value_len`: u16
+      - `value_bytes`: `value_len` bytes (UTF-8)
 
 ### Footer record (type = 8)
 
@@ -244,4 +252,8 @@ Then repeated `count` times:
   - If column is `F64`: `min`: f64, `max`: f64
   - If column is `I64`: `min`: i64, `max`: i64
   - If column is `Bool`: `min`: u8, `max`: u8
-  - If column is `Utf8`: `min_len`: u32, `max_len`: u32
+  - If column is `Utf8`:
+    - `min_len`: u32, `max_len`: u32
+    - `distinct_count`: u16, then repeated `distinct_count` times:
+      - `value_len`: u16
+      - `value_bytes`: `value_len` bytes (UTF-8)

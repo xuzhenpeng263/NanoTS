@@ -17,5 +17,7 @@ pub mod datafusion;
 
 pub mod c_api;
 
-pub use crate::db::{AutoMaintenanceOptions, NanoTsDb, NanoTsDbShared, NanoTsOptions, Point};
+pub use crate::db::{
+    AutoMaintenanceOptions, DbDiagnostics, NanoTsDb, NanoTsDbShared, NanoTsOptions, Point,
+};
 pub use crate::storage::TableStats;
