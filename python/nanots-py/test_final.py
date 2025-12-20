@@ -1,6 +1,6 @@
 import os
 
-import nanots
+import nanots_db
 
 try:
     import numpy as np
@@ -19,7 +19,7 @@ if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
 
 print(">>> init db")
-db = nanots.Db(DB_PATH, 3600 * 1000)
+db = nanots_db.Db(DB_PATH, 3600 * 1000)
 
 print(">>> write 100k points")
 ts_base = 1704067200000

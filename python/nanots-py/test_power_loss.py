@@ -7,7 +7,7 @@ import time
 
 from typing import Optional
 
-import nanots
+import nanots_db
 
 
 def run_supervisor(args: argparse.Namespace) -> int:
@@ -60,7 +60,7 @@ def run_writer(args: argparse.Namespace) -> int:
     path = args.path or "data/power_loss.ntt"
     expected_path = args.expected or f"{path}.expected"
 
-    db = nanots.Db(path)
+    db = nanots_db.Db(path)
     try:
         db.create_table("t", ["v"])
     except Exception:
@@ -88,7 +88,7 @@ def verify_db(path: str, expected_path: str, allow_corruption: bool) -> None:
         return
     max_ts = expected[-1]
 
-    db = nanots.Db(path)
+    db = nanots_db.Db(path)
     try:
         ts, cols = db.query_table_range_columns("t", 0, max_ts)
     except Exception:

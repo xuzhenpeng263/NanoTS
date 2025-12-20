@@ -1,8 +1,8 @@
-import nanots
+import nanots_db
 
 
 def main() -> None:
-    db = nanots.Db("data/sql_demo.ntt")
+    db = nanots_db.Db("data/sql_demo.ntt")
     db.create_table("sensor", ["value"])
     for i in range(10):
         db.append_row("sensor", 1704067200000 + i * 1000, [float(i)])

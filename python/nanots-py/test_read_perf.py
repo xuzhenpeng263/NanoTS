@@ -3,7 +3,7 @@ import random
 import statistics
 import time
 
-import nanots
+import nanots_db
 
 
 DEFAULT_START_MS = -2**62
@@ -76,7 +76,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42, help="RNG seed for window mode")
     args = ap.parse_args()
 
-    db = nanots.Db(args.db)
+    db = nanots_db.Db(args.db)
 
     try:
         st = db.stats(args.table)

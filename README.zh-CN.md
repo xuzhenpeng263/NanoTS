@@ -165,12 +165,17 @@ maturin develop --release
 该命令会将本地 `nanots_db` 扩展模块安装到当前 Python 环境。
 类型提示位于 `python/nanots-py/nanots_db.pyi`。
 
+测试安装：
+```bash
+python -c "import nanots_db; print(nanots_db.__version__)"
+```
+
 ### 基础写入与 flush
 
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt", 3600 * 1000)  # retention: 1 小时（毫秒）
+db = nanots_db.Db("./my_db.ntt", 3600 * 1000)  # retention: 1 小时（毫秒）
 db.append("sensor_x", 1704067200000, 25.5)
 db.flush()
 ```
@@ -180,7 +185,7 @@ db.flush()
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 db.create_table("sensor", ["temp", "humidity"])
 
 t0 = 1704067200000
@@ -198,7 +203,7 @@ print("rows:", len(ts_ms), "cols:", len(cols))
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 # 创建混合类型表
 db.create_table_typed("events", [
     ("sensor_id", "i64"),
@@ -229,7 +234,7 @@ print(f"温度: {cols[1][:5]}")  # f64 列
 import nanots_db
 import pyarrow.lib
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 schema_capsule, array_capsule = db.query_table_range_arrow_capsules("sensor", 0, 10**18)
 batch = pyarrow.lib.RecordBatch._import_from_c_capsule(schema_capsule, array_capsule)
 
@@ -243,7 +248,7 @@ print(df.head())
 import nanots_db
 import pyarrow as pa
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 batch = pa.record_batch(
     [
         pa.array([1000, 1001, 1002], type=pa.int64()),
@@ -283,7 +288,7 @@ int main(void) {
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 print(db.stats("sensor"))
 ```
 
@@ -292,7 +297,7 @@ print(db.stats("sensor"))
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 db.pack_table("sensor", 8192)
 ```
 
@@ -301,7 +306,7 @@ db.pack_table("sensor", 8192)
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 
 # 同步 SQL 到 Pandas
 df = db.query_sql_to_pandas("SELECT * FROM sensor WHERE ts_ms > 1704067200000")
@@ -334,7 +339,7 @@ for batch in reader:
 ```python
 import nanots_db
 
-db = nanots.Db("./my_db.ntt")
+db = nanots_db.Db("./my_db.ntt")
 
 # 获取表统计信息
 stats = db.stats("sensor")
