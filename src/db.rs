@@ -152,6 +152,51 @@ pub struct DbDiagnostics {
 }
 
 #[derive(Debug, Clone)]
+pub struct ColumnDiagnostics {
+    pub column: String,
+    pub col_type: ColumnType,
+    pub logical_bytes: u64,
+    pub stored_bytes: u64,
+    pub compression_ratio: Option<f64>,
+    pub rows: u64,
+    pub nulls: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableDiagnostics {
+    pub table: String,
+    pub rows: u64,
+    pub segments: u64,
+    pub ts_compression_ratio: Option<f64>,
+    pub value_compression_ratio: Option<f64>,
+    pub total_compression_ratio: Option<f64>,
+    pub columns: Vec<ColumnDiagnostics>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaintenanceDiagnostics {
+    pub pack_success: u64,
+    pub pack_fail: u64,
+    pub retention_success: u64,
+    pub retention_fail: u64,
+    pub last_pack_error: Option<String>,
+    pub last_retention_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DbDiagnosticsReport {
+    pub wal_bytes: u64,
+    pub total_table_segment_bytes: u64,
+    pub wal_ratio: Option<f64>,
+    pub pending_rows: u64,
+    pub pending_tables: u64,
+    pub writes_per_sec: u64,
+    pub last_write_age_ms: u64,
+    pub tables: Vec<TableDiagnostics>,
+    pub maintenance: MaintenanceDiagnostics,
+}
+
+#[derive(Debug, Clone)]
 struct MappedPredicate {
     col_idx: usize,
     op: ColumnPredicateOp,
@@ -560,6 +605,7 @@ pub struct NanoTsDb {
     options: NanoTsOptions,
     tables: HashMap<String, TableBuffer>,
     write_stats: WriteStats,
+    maintenance_stats: MaintenanceStats,
 }
 
 #[derive(Debug)]
@@ -567,6 +613,16 @@ struct WriteStats {
     window_start: Instant,
     writes: u64,
     last_write: Instant,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MaintenanceStats {
+    pack_success: u64,
+    pack_fail: u64,
+    retention_success: u64,
+    retention_fail: u64,
+    last_pack_error: Option<String>,
+    last_retention_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -643,6 +699,7 @@ impl NanoTsDb {
                 writes: 0,
                 last_write: Instant::now(),
             },
+            maintenance_stats: MaintenanceStats::default(),
         };
 
         db.load_table_schemas()?;
@@ -1256,6 +1313,79 @@ impl NanoTsDb {
         })
     }
 
+    pub fn get_diagnostics(&self) -> io::Result<DbDiagnosticsReport> {
+        let base = self.diagnose()?;
+        let mut tables = Vec::new();
+        for table in self.storage.list_tables()? {
+            let schema = self.storage.read_table_schema(&table)?;
+            let table_stats = self.storage.table_stats(&table)?;
+            let col_stats = self.storage.table_column_stats(&table)?;
+            let mut columns = Vec::with_capacity(schema.columns.len());
+            let mut logical_value_bytes = 0u64;
+            let mut stored_value_bytes = 0u64;
+            for (col, stats) in schema.columns.iter().zip(col_stats.iter()) {
+                logical_value_bytes = logical_value_bytes.saturating_add(stats.logical_bytes);
+                stored_value_bytes = stored_value_bytes.saturating_add(stats.stored_bytes);
+                let compression_ratio = if stats.stored_bytes > 0 {
+                    Some(stats.logical_bytes as f64 / stats.stored_bytes as f64)
+                } else {
+                    None
+                };
+                columns.push(ColumnDiagnostics {
+                    column: col.name.clone(),
+                    col_type: col.col_type,
+                    logical_bytes: stats.logical_bytes,
+                    stored_bytes: stats.stored_bytes,
+                    compression_ratio,
+                    rows: stats.rows,
+                    nulls: stats.nulls,
+                });
+            }
+            let ts_compression_ratio = if table_stats.stored_ts_bytes > 0 {
+                Some(table_stats.raw_ts_bytes as f64 / table_stats.stored_ts_bytes as f64)
+            } else {
+                None
+            };
+            let value_compression_ratio = if stored_value_bytes > 0 {
+                Some(logical_value_bytes as f64 / stored_value_bytes as f64)
+            } else {
+                None
+            };
+            let total_stored = table_stats
+                .stored_ts_bytes
+                .saturating_add(stored_value_bytes);
+            let total_logical = table_stats
+                .raw_ts_bytes
+                .saturating_add(logical_value_bytes);
+            let total_compression_ratio = if total_stored > 0 {
+                Some(total_logical as f64 / total_stored as f64)
+            } else {
+                None
+            };
+            tables.push(TableDiagnostics {
+                table,
+                rows: table_stats.rows,
+                segments: table_stats.segments,
+                ts_compression_ratio,
+                value_compression_ratio,
+                total_compression_ratio,
+                columns,
+            });
+        }
+
+        Ok(DbDiagnosticsReport {
+            wal_bytes: base.wal_bytes,
+            total_table_segment_bytes: base.total_table_segment_bytes,
+            wal_ratio: base.wal_ratio,
+            pending_rows: base.pending_rows,
+            pending_tables: base.pending_tables,
+            writes_per_sec: base.writes_per_sec,
+            last_write_age_ms: base.last_write_age_ms,
+            tables,
+            maintenance: self.maintenance_snapshot(),
+        })
+    }
+
     pub fn last_seq(&self) -> u64 {
         self.meta.last_seq
     }
@@ -1571,6 +1701,47 @@ impl NanoTsDb {
     fn idle_for_pack(&self, opts: &AutoMaintenanceOptions) -> bool {
         self.write_stats.last_write.elapsed() >= opts.min_idle_time
     }
+
+    fn record_pack_result(&mut self, result: &io::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.maintenance_stats.pack_success =
+                    self.maintenance_stats.pack_success.saturating_add(1);
+                self.maintenance_stats.last_pack_error = None;
+            }
+            Err(err) => {
+                self.maintenance_stats.pack_fail =
+                    self.maintenance_stats.pack_fail.saturating_add(1);
+                self.maintenance_stats.last_pack_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn record_retention_result(&mut self, result: &io::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.maintenance_stats.retention_success =
+                    self.maintenance_stats.retention_success.saturating_add(1);
+                self.maintenance_stats.last_retention_error = None;
+            }
+            Err(err) => {
+                self.maintenance_stats.retention_fail =
+                    self.maintenance_stats.retention_fail.saturating_add(1);
+                self.maintenance_stats.last_retention_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn maintenance_snapshot(&self) -> MaintenanceDiagnostics {
+        MaintenanceDiagnostics {
+            pack_success: self.maintenance_stats.pack_success,
+            pack_fail: self.maintenance_stats.pack_fail,
+            retention_success: self.maintenance_stats.retention_success,
+            retention_fail: self.maintenance_stats.retention_fail,
+            last_pack_error: self.maintenance_stats.last_pack_error.clone(),
+            last_retention_error: self.maintenance_stats.last_retention_error.clone(),
+        }
+    }
 }
 
 fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptions) {
@@ -1588,7 +1759,8 @@ fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptio
             if guard.options.retention.is_some()
                 && last_retention.elapsed() >= opts.retention_check_interval
             {
-                let _ = guard.compact_retention_now();
+                let result = guard.compact_retention_now();
+                guard.record_retention_result(&result);
                 last_retention = std::time::Instant::now();
             }
             let should_pack = match guard.should_auto_pack(&opts) {
@@ -1596,7 +1768,9 @@ fn spawn_auto_maintenance(db: Weak<RwLock<NanoTsDb>>, opts: AutoMaintenanceOptio
                 Err(_) => continue,
             };
             if should_pack && !guard.write_load_high(&opts) && guard.idle_for_pack(&opts) {
-                let _ = guard.pack_all_tables_tiered(opts.target_segment_points, opts.max_segments_per_pack);
+                let result =
+                    guard.pack_all_tables_tiered(opts.target_segment_points, opts.max_segments_per_pack);
+                guard.record_pack_result(&result);
             }
         }
     });
@@ -1635,20 +1809,27 @@ mod tests {
         {
             let mut db = NanoTsDb::open(&path, opts.clone()).unwrap();
             db.create_table("sensor", &["temp", "humidity"]).unwrap();
+            let base = now_ms().saturating_sub(2_000);
             for i in 0..1000i64 {
-                db.append_row("sensor", 1000 + i, &[25.0 + (i as f64) * 0.01, 60.0])
+                db.append_row(
+                    "sensor",
+                    base + i,
+                    &[25.0 + (i as f64) * 0.01, 60.0],
+                )
                     .unwrap();
             }
             db.flush().unwrap();
         }
         {
             let db = NanoTsDb::open(&path, opts).unwrap();
-            let (ts, cols) = db.query_table_range_columns("sensor", 1200, 1300).unwrap();
+            let base = now_ms().saturating_sub(2_000);
+            let (ts, cols) =
+                db.query_table_range_columns("sensor", base + 200, base + 300).unwrap();
             assert!(!ts.is_empty());
             assert_eq!(cols.len(), 2);
             assert_eq!(ts.len(), cols[0].len());
             assert_eq!(ts.len(), cols[1].len());
-            assert!(ts[0] >= 1200 && *ts.last().unwrap() <= 1300);
+            assert!(ts[0] >= base + 200 && *ts.last().unwrap() <= base + 300);
         }
         let _ = fs::remove_file(path);
     }
@@ -1673,6 +1854,54 @@ mod tests {
             assert_eq!(ts.len(), cols[0].len());
             assert_eq!(ts.len(), cols[1].len());
             assert!(ts.len() >= 5000);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_get_diagnostics_report() {
+        let path = fresh_db_path("diagnostics_report");
+        let mut db = NanoTsDb::open(&path, NanoTsOptions::default()).unwrap();
+        db.create_table_typed(
+            "metrics",
+            &[
+                ("temp", ColumnType::F64),
+                ("flag", ColumnType::Bool),
+                ("tag", ColumnType::Utf8),
+            ],
+        )
+        .unwrap();
+        db.append_row_typed(
+            "metrics",
+            1000,
+            &[
+                Value::F64(1.0),
+                Value::Bool(true),
+                Value::Utf8("a".to_string()),
+            ],
+        )
+        .unwrap();
+        db.append_row_typed(
+            "metrics",
+            1001,
+            &[
+                Value::F64(2.0),
+                Value::Bool(false),
+                Value::Utf8("a".to_string()),
+            ],
+        )
+        .unwrap();
+        db.flush().unwrap();
+
+        let diag = db.get_diagnostics().unwrap();
+        assert_eq!(diag.tables.len(), 1);
+        let table = &diag.tables[0];
+        assert_eq!(table.table, "metrics");
+        assert_eq!(table.columns.len(), 3);
+        assert!(table.value_compression_ratio.is_some());
+        for col in &table.columns {
+            assert!(col.rows >= 2);
+            assert!(col.stored_bytes > 0);
         }
         let _ = fs::remove_file(path);
     }

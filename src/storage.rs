@@ -71,6 +71,14 @@ pub struct TableStats {
     pub schema_file_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColumnStorageStats {
+    pub stored_bytes: u64,
+    pub logical_bytes: u64,
+    pub rows: u64,
+    pub nulls: u64,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -916,6 +924,35 @@ impl Storage {
         })
     }
 
+    pub fn table_column_stats(&self, table: &str) -> io::Result<Vec<ColumnStorageStats>> {
+        let schema = self.read_table_schema(table)?;
+        let index = self.load_or_rebuild_table_index(table)?;
+        let mut out = vec![ColumnStorageStats::default(); schema.columns.len()];
+        if index.is_empty() {
+            return Ok(out);
+        }
+        let file = File::open(&self.path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        for e in index {
+            let off = e.offset as usize;
+            let end = off.saturating_add(e.len as usize);
+            if end > mmap.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "table index range out of bounds",
+                ));
+            }
+            let (count, seg_stats) = table_segment_column_stats(&mmap[off..end], &schema)?;
+            for (dst, seg) in out.iter_mut().zip(seg_stats) {
+                dst.stored_bytes = dst.stored_bytes.saturating_add(seg.stored_bytes);
+                dst.logical_bytes = dst.logical_bytes.saturating_add(seg.logical_bytes);
+                dst.rows = dst.rows.saturating_add(count);
+                dst.nulls = dst.nulls.saturating_add(seg.nulls);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn table_time_range(&self, table: &str) -> io::Result<Option<(i64, i64)>> {
         let _ = self.read_table_schema(table)?;
         let index = self.load_or_rebuild_table_index(table)?;
@@ -1619,6 +1656,103 @@ fn is_valid(bitmap: &[u8], idx: usize) -> bool {
     (bitmap[byte] >> bit) & 1 == 1
 }
 
+fn count_valid(bitmap: &[u8], total: usize) -> usize {
+    if bitmap.is_empty() {
+        return total;
+    }
+    let mut count = 0usize;
+    for i in 0..total {
+        if is_valid(bitmap, i) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn utf8_logical_bytes(blob: &[u8], count: usize, nulls: &[u8]) -> io::Result<u64> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if blob.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short utf8 column",
+        ));
+    }
+    let dict_count = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+    let offsets_bytes_len = (dict_count + 1)
+        .checked_mul(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
+    let header_len = 4 + offsets_bytes_len;
+    if blob.len() < header_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short utf8 column",
+        ));
+    }
+    let mut offsets: Vec<u32> = Vec::with_capacity(dict_count + 1);
+    let mut pos = 4;
+    for _ in 0..=dict_count {
+        let end = pos + 4;
+        offsets.push(u32::from_le_bytes(blob[pos..end].try_into().unwrap()));
+        pos = end;
+    }
+    let dict_bytes_len: usize = offsets
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8 dict overflow"))?;
+    let dict_bytes_end = header_len + dict_bytes_len;
+    if dict_bytes_end > blob.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short utf8 column",
+        ));
+    }
+    let indices_len = count
+        .checked_mul(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow"))?;
+    if dict_bytes_end + indices_len > blob.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short utf8 column",
+        ));
+    }
+    if dict_count == 0 {
+        if nulls.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty utf8 dict with values",
+            ));
+        }
+        return Ok(0);
+    }
+
+    let indices = &blob[dict_bytes_end..dict_bytes_end + indices_len];
+    let mut total = 0u64;
+    for i in 0..count {
+        if !nulls.is_empty() && !is_valid(nulls, i) {
+            continue;
+        }
+        let idx_start = i * 4;
+        let idx = u32::from_le_bytes(
+            indices[idx_start..idx_start + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if idx >= dict_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "utf8 dict index out of range",
+            ));
+        }
+        let len = offsets[idx + 1].saturating_sub(offsets[idx]) as u64;
+        total = total.saturating_add(len);
+    }
+    Ok(total)
+}
+
 fn encode_table_schema_bytes(schema: &TableSchema) -> io::Result<Vec<u8>> {
     if schema.columns.is_empty() {
         return Err(io::Error::new(
@@ -1974,6 +2108,112 @@ fn table_segment_storage_stats(
     }
 
     Ok((count, ts_len, stored_value_bytes, header_bytes))
+}
+
+fn table_segment_column_stats(
+    data: &[u8],
+    schema: &TableSchema,
+) -> io::Result<(u64, Vec<ColumnStorageStats>)> {
+    let mut pos = 0usize;
+    let mut read_exact = |len: usize| -> io::Result<&[u8]> {
+        if data.len() < pos + len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "segment too short",
+            ));
+        }
+        let out = &data[pos..pos + len];
+        pos += len;
+        Ok(out)
+    };
+
+    let magic = read_exact(4)?;
+    if magic != TABLE_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table magic"));
+    }
+    let ver = read_exact(1)?[0];
+    if ver != TABLE_VERSION {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad table version"));
+    }
+
+    read_exact(8)?; // min_seq
+    read_exact(8)?; // max_seq
+    let count = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+    read_exact(8)?; // min_ts
+    read_exact(8)?; // max_ts
+    let ext_len = u16::from_le_bytes(read_exact(2)?.try_into().unwrap()) as usize;
+    if ext_len > 0 {
+        let _ = read_exact(ext_len)?;
+    }
+
+    let codec = read_exact(1)?[0];
+    if codec != TS_CODEC_TS64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown ts codec (likely old layout; recreate DB)",
+        ));
+    }
+    let ts_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+    let _ = read_exact(ts_len)?;
+
+    let ncols = u16::from_le_bytes(read_exact(2)?.try_into().unwrap()) as usize;
+    if ncols != schema.columns.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "schema mismatch"));
+    }
+
+    let mut out = vec![ColumnStorageStats::default(); ncols];
+    for (idx, col) in schema.columns.iter().enumerate() {
+        let null_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+        let null_bytes = read_exact(null_len)?;
+        let non_nulls = count_valid(null_bytes, count);
+        let nulls = count.saturating_sub(non_nulls) as u64;
+        let ccodec = read_exact(1)?[0];
+        let clen = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+        let blob = read_exact(clen)?;
+
+        match col.col_type {
+            ColumnType::F64 => {
+                if ccodec != TABLE_COL_F64_XOR && ccodec != TABLE_COL_I64_D2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
+                out[idx].logical_bytes = out[idx]
+                    .logical_bytes
+                    .saturating_add((non_nulls as u64).saturating_mul(8));
+            }
+            ColumnType::I64 => {
+                if ccodec != TABLE_COL_I64_D2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
+                out[idx].logical_bytes = out[idx]
+                    .logical_bytes
+                    .saturating_add((non_nulls as u64).saturating_mul(8));
+            }
+            ColumnType::Bool => {
+                if ccodec != TABLE_COL_BOOL {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
+                out[idx].logical_bytes = out[idx]
+                    .logical_bytes
+                    .saturating_add(non_nulls as u64);
+            }
+            ColumnType::Utf8 => {
+                if ccodec != TABLE_COL_UTF8 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown col codec"));
+                }
+                let logical = utf8_logical_bytes(blob, count, null_bytes)?;
+                out[idx].logical_bytes = out[idx].logical_bytes.saturating_add(logical);
+            }
+        }
+
+        let stored_bytes = (null_len as u64)
+            .saturating_add(1)
+            .saturating_add(4)
+            .saturating_add(clen as u64);
+        out[idx].stored_bytes = out[idx].stored_bytes.saturating_add(stored_bytes);
+        out[idx].nulls = out[idx].nulls.saturating_add(nulls);
+    }
+
+    Ok((count as u64, out))
 }
 
 #[derive(Debug)]

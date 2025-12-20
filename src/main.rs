@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 pub use nanots::compressor::TimeSeriesCompressor;
-use nanots::{NanoTsDb, NanoTsOptions};
+use nanots::{ColumnType, NanoTsDb, NanoTsOptions};
 
 use std::env;
 
@@ -57,12 +57,79 @@ fn main() {
             Some(d) => println!("retention_ms: {}", d.as_millis()),
             None => println!("retention_ms: none"),
         }
-        if tables.is_empty() {
-            println!("tables: (none)");
-        } else {
-            println!("tables:");
-            for t in tables {
-                println!("  - {}", t);
+        match db.get_diagnostics() {
+            Ok(diag) => {
+                println!("wal_bytes: {}", diag.wal_bytes);
+                println!("segment_bytes: {}", diag.total_table_segment_bytes);
+                match diag.wal_ratio {
+                    Some(r) => println!("wal_ratio: {:.3}", r),
+                    None => println!("wal_ratio: none"),
+                }
+                println!("pending_rows: {}", diag.pending_rows);
+                println!("pending_tables: {}", diag.pending_tables);
+                println!("writes_per_sec: {}", diag.writes_per_sec);
+                println!("last_write_age_ms: {}", diag.last_write_age_ms);
+                println!(
+                    "maintenance: pack ok={} fail={} retention ok={} fail={}",
+                    diag.maintenance.pack_success,
+                    diag.maintenance.pack_fail,
+                    diag.maintenance.retention_success,
+                    diag.maintenance.retention_fail
+                );
+                if let Some(err) = diag.maintenance.last_pack_error.as_ref() {
+                    println!("maintenance_last_pack_error: {}", err);
+                }
+                if let Some(err) = diag.maintenance.last_retention_error.as_ref() {
+                    println!("maintenance_last_retention_error: {}", err);
+                }
+
+                if diag.tables.is_empty() {
+                    println!("tables: (none)");
+                } else {
+                    println!("tables:");
+                    for t in diag.tables {
+                        println!("  - {} (rows={}, segments={})", t.table, t.rows, t.segments);
+                        match t.ts_compression_ratio {
+                            Some(r) => println!("    ts_compression: {:.3}", r),
+                            None => println!("    ts_compression: none"),
+                        }
+                        match t.value_compression_ratio {
+                            Some(r) => println!("    value_compression: {:.3}", r),
+                            None => println!("    value_compression: none"),
+                        }
+                        match t.total_compression_ratio {
+                            Some(r) => println!("    total_compression: {:.3}", r),
+                            None => println!("    total_compression: none"),
+                        }
+                        if t.columns.is_empty() {
+                            println!("    columns: (none)");
+                        } else {
+                            println!("    columns:");
+                            for c in t.columns {
+                                let col_type = format_column_type(c.col_type);
+                                let ratio = c
+                                    .compression_ratio
+                                    .map(|v| format!("{:.3}", v))
+                                    .unwrap_or_else(|| "none".to_string());
+                                println!(
+                                    "      - {} ({}) logical={} stored={} ratio={} nulls={}",
+                                    c.column, col_type, c.logical_bytes, c.stored_bytes, ratio, c.nulls
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("诊断失败: {}", err);
+                if tables.is_empty() {
+                    println!("tables: (none)");
+                } else {
+                    println!("tables:");
+                    for t in tables {
+                        println!("  - {}", t);
+                    }
+                }
             }
         }
     } else {
@@ -93,6 +160,15 @@ fn main() {
 
         println!("  cargo run --release -- pack <db_path> <table> [--target N]  # 手动 Compaction");
         println!("  cargo run --release -- info <db_path>                       # 查看 DB 信息");
+    }
+}
+
+fn format_column_type(col_type: ColumnType) -> &'static str {
+    match col_type {
+        ColumnType::F64 => "F64",
+        ColumnType::I64 => "I64",
+        ColumnType::Bool => "Bool",
+        ColumnType::Utf8 => "Utf8",
     }
 }
 
