@@ -439,7 +439,7 @@ impl Storage {
             .collect();
         let mut acc_min_seq: u64 = 0;
         let mut acc_max_seq: u64 = 0;
-        let mut new_segments: Vec<Vec<u8>> = Vec::new();
+        let tmp = rewrite_db_without_table(&self.path, table)?;
 
         for e in index {
             let off = e.offset as usize;
@@ -487,7 +487,10 @@ impl Storage {
                         acc_min_seq,
                         acc_max_seq,
                     )?;
-                    new_segments.push(bytes);
+                    if !bytes.is_empty() {
+                        let payload = encode_named_payload(table, &bytes)?;
+                        dbfile::append_record(&tmp, dbfile::RECORD_TABLE_SEGMENT, &payload)?;
+                    }
                     acc_ts.clear();
                     for c in &mut acc_cols {
                         match c {
@@ -503,10 +506,13 @@ impl Storage {
 
         if !acc_ts.is_empty() {
             let bytes = encode_table_segment(&schema, &acc_ts, &acc_cols, acc_min_seq, acc_max_seq)?;
-            new_segments.push(bytes);
+            if !bytes.is_empty() {
+                let payload = encode_named_payload(table, &bytes)?;
+                dbfile::append_record(&tmp, dbfile::RECORD_TABLE_SEGMENT, &payload)?;
+            }
         }
 
-        rewrite_db_with_table_segments(&self.path, table, &new_segments)?;
+        std::fs::rename(&tmp, &self.path)?;
         let new_state = scan_db_file(&self.path)?;
         *self.state.lock().unwrap() = new_state;
         self.write_table_index(table)?;
@@ -1531,11 +1537,7 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
     Ok(state)
 }
 
-fn rewrite_db_with_table_segments(
-    path: &Path,
-    table: &str,
-    new_segments: &[Vec<u8>],
-) -> io::Result<()> {
+fn rewrite_db_without_table(path: &Path, table: &str) -> io::Result<PathBuf> {
     let tmp = dbfile::temp_db_path(path, "pack");
     dbfile::create_new_db_file(&tmp)?;
     dbfile::iter_records(path, |hdr, payload| {
@@ -1559,17 +1561,7 @@ fn rewrite_db_with_table_segments(
         dbfile::append_record(&tmp, hdr.record_type, payload)?;
         Ok(())
     })?;
-
-    for seg in new_segments {
-        if seg.is_empty() {
-            continue;
-        }
-        let payload = encode_named_payload(table, seg)?;
-        dbfile::append_record(&tmp, dbfile::RECORD_TABLE_SEGMENT, &payload)?;
-    }
-
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(tmp)
 }
 
 
