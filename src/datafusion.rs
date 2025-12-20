@@ -307,32 +307,50 @@ impl TableProvider for NanoTsTable {
         let db = self.db.clone();
         let table = self.table.clone();
         let schema = self.schema.clone();
-        let limit_copy = limit;
+        let _ = limit;
+        let partitions = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
         let batches = task::spawn_blocking(move || {
-            let (ts, cols) = db
-                .query_table_range_typed_snapshot_with_predicates(&table, start, end, &predicates)
+            let parts = db
+                .query_table_range_typed_snapshot_partitions_with_predicates(
+                    &table,
+                    start,
+                    end,
+                    &predicates,
+                    partitions,
+                )
                 .map_err(|e| DataFusionError::Execution(format!("query failed: {e}")))?;
-            NanoTsTable::build_batches(schema, ts, cols, limit_copy)
+            let mut out = Vec::with_capacity(parts.len());
+            for (ts, cols) in parts {
+                let batches = NanoTsTable::build_batches(schema.clone(), ts, cols, None)?;
+                out.push(batches);
+            }
+            Ok::<_, DataFusionError>(out)
         })
         .await
         .map_err(|e| DataFusionError::Execution(format!("blocking task failed: {e}")))?;
 
-        let mut batches = batches?;
+        let mut partitions = batches?;
         if let Some(proj) = projection {
-            let mut projected = Vec::with_capacity(batches.len());
-            for batch in batches {
-                projected.push(batch.project(proj).map_err(|e| {
-                    DataFusionError::Execution(format!("projection failed: {e}"))
-                })?);
+            for part in &mut partitions {
+                let mut projected = Vec::with_capacity(part.len());
+                for batch in part.drain(..) {
+                    projected.push(batch.project(proj).map_err(|e| {
+                        DataFusionError::Execution(format!("projection failed: {e}"))
+                    })?);
+                }
+                *part = projected;
             }
-            batches = projected;
         }
 
-        let schema = batches
-            .get(0)
+        let schema = partitions
+            .iter()
+            .flat_map(|part| part.first())
             .map(|b| b.schema())
+            .next()
             .unwrap_or_else(|| self.schema.clone());
-        let exec = MemoryExec::try_new(&[batches], schema, None)?;
+        let exec = MemoryExec::try_new(&partitions, schema, None)?;
         Ok(Arc::new(exec))
     }
 

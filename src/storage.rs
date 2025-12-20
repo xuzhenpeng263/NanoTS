@@ -5,6 +5,7 @@ use crate::compressor::{compress_f64_xor, decompress_f64_xor};
 use crate::db::{ColumnData, ColumnPredicate, ColumnPredicateOp, ColumnPredicateValue, ColumnSchema, ColumnType, Point, TableSchema};
 use crate::dbfile;
 use memmap2::{Advice, MmapOptions};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -459,78 +460,87 @@ impl Storage {
                     ColumnType::I64 => ColumnData::I64(Vec::new()),
                     ColumnType::Bool => ColumnData::Bool(Vec::new()),
                     ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
-                })
-                .collect();
+            })
+            .collect();
             return Ok((Vec::new(), cols));
         }
         let file = File::open(&self.path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         let _ = mmap.advise(Advice::Sequential);
-
-        let mut out_ts: Vec<i64> = Vec::new();
-        let mut out_cols: Vec<ColumnData> = schema
-            .columns
-            .iter()
-            .map(|col| match col.col_type {
-                ColumnType::F64 => ColumnData::F64(Vec::new()),
-                ColumnType::I64 => ColumnData::I64(Vec::new()),
-                ColumnType::Bool => ColumnData::Bool(Vec::new()),
-                ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
-            })
-            .collect();
         let mapped_predicates = map_predicates(schema, predicates);
+        let entries = filter_index_entries(index, max_offset);
+        read_table_columns_from_entries(
+            &mmap,
+            table,
+            schema,
+            &entries,
+            start_ms,
+            end_ms,
+            &mapped_predicates,
+        )
+    }
 
-        for e in index {
-            if let Some(max_offset) = max_offset {
-                if e.offset.saturating_add(e.len) > max_offset {
-                    continue;
-                }
-            }
-            if e.max_ts < start_ms || e.min_ts > end_ms {
-                continue;
-            }
-            if !mapped_predicates.is_empty() && !entry_may_match_predicates(&e, &mapped_predicates) {
-                continue;
-            }
-            let off = e.offset as usize;
-            let end = off.saturating_add(e.len as usize);
-            if end > mmap.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "table index range out of bounds",
-                ));
-            }
-            verify_table_segment_checksum(&mmap, table, &e)?;
-            let seg = read_table_segment_from_bytes(&mmap[off..end], schema)?;
-            for i in 0..seg.ts_ms.len() {
-                let t = seg.ts_ms[i];
-                if t < start_ms || t > end_ms {
-                    continue;
-                }
-                if !mapped_predicates.is_empty()
-                    && !row_matches_predicates(&mapped_predicates, &seg.cols, i)
-                {
-                    continue;
-                }
-                out_ts.push(t);
-                for (cidx, col) in seg.cols.iter().enumerate() {
-                    match (&mut out_cols[cidx], col) {
-                        (ColumnData::F64(dst), ColumnData::F64(src)) => dst.push(src[i]),
-                        (ColumnData::I64(dst), ColumnData::I64(src)) => dst.push(src[i]),
-                        (ColumnData::Bool(dst), ColumnData::Bool(src)) => dst.push(src[i]),
-                        (ColumnData::Utf8(dst), ColumnData::Utf8(src)) => dst.push(src[i].clone()),
-                        _ => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "column type mismatch",
-                            ))
-                        }
-                    }
-                }
-            }
+    pub fn read_table_columns_in_range_filtered_partitions_with_limit(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        start_ms: i64,
+        end_ms: i64,
+        predicates: &[ColumnPredicate],
+        max_offset: Option<u64>,
+        partitions: usize,
+    ) -> io::Result<Vec<(Vec<i64>, Vec<ColumnData>)>> {
+        let index = self.load_or_rebuild_table_index(table)?;
+        if index.is_empty() {
+            let cols = schema
+                .columns
+                .iter()
+                .map(|col| match col.col_type {
+                    ColumnType::F64 => ColumnData::F64(Vec::new()),
+                    ColumnType::I64 => ColumnData::I64(Vec::new()),
+                    ColumnType::Bool => ColumnData::Bool(Vec::new()),
+                    ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+                })
+                .collect();
+            return Ok(vec![(Vec::new(), cols)]);
         }
+        let file = File::open(&self.path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let _ = mmap.advise(Advice::WillNeed);
 
-        Ok((out_ts, out_cols))
+        let mapped_predicates = map_predicates(schema, predicates);
+        let entries = filter_index_entries(index, max_offset);
+        if entries.is_empty() {
+            let cols = schema
+                .columns
+                .iter()
+                .map(|col| match col.col_type {
+                    ColumnType::F64 => ColumnData::F64(Vec::new()),
+                    ColumnType::I64 => ColumnData::I64(Vec::new()),
+                    ColumnType::Bool => ColumnData::Bool(Vec::new()),
+                    ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+                })
+                .collect();
+            return Ok(vec![(Vec::new(), cols)]);
+        }
+        let part_count = partitions.max(1).min(entries.len());
+        let chunk_size = (entries.len() + part_count - 1) / part_count;
+        let chunks: Vec<&[TableIndexEntry]> = entries.chunks(chunk_size).collect();
+        let results: Vec<(Vec<i64>, Vec<ColumnData>)> = chunks
+            .par_iter()
+            .map(|chunk| {
+                read_table_columns_from_entries(
+                    &mmap,
+                    table,
+                    schema,
+                    chunk,
+                    start_ms,
+                    end_ms,
+                    &mapped_predicates,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(results)
     }
 
     pub fn compact_table_retention(&self, table: &str, cutoff_ms: i64) -> io::Result<()> {
@@ -1538,6 +1548,90 @@ fn map_predicates(schema: &TableSchema, predicates: &[ColumnPredicate]) -> Vec<M
     out
 }
 
+fn filter_index_entries(
+    index: Vec<TableIndexEntry>,
+    max_offset: Option<u64>,
+) -> Vec<TableIndexEntry> {
+    index
+        .into_iter()
+        .filter(|e| {
+            if let Some(max_offset) = max_offset {
+                e.offset.saturating_add(e.len) <= max_offset
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+fn read_table_columns_from_entries(
+    mmap: &memmap2::Mmap,
+    table: &str,
+    schema: &TableSchema,
+    entries: &[TableIndexEntry],
+    start_ms: i64,
+    end_ms: i64,
+    mapped_predicates: &[MappedPredicate],
+) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
+    let mut out_ts: Vec<i64> = Vec::new();
+    let mut out_cols: Vec<ColumnData> = schema
+        .columns
+        .iter()
+        .map(|col| match col.col_type {
+            ColumnType::F64 => ColumnData::F64(Vec::new()),
+            ColumnType::I64 => ColumnData::I64(Vec::new()),
+            ColumnType::Bool => ColumnData::Bool(Vec::new()),
+            ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
+        })
+        .collect();
+
+    for e in entries {
+        if e.max_ts < start_ms || e.min_ts > end_ms {
+            continue;
+        }
+        if !mapped_predicates.is_empty() && !entry_may_match_predicates(e, mapped_predicates) {
+            continue;
+        }
+        let off = e.offset as usize;
+        let end = off.saturating_add(e.len as usize);
+        if end > mmap.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table index range out of bounds",
+            ));
+        }
+        verify_table_segment_checksum(mmap, table, e)?;
+        let seg = read_table_segment_from_bytes(&mmap[off..end], schema)?;
+        for i in 0..seg.ts_ms.len() {
+            let t = seg.ts_ms[i];
+            if t < start_ms || t > end_ms {
+                continue;
+            }
+            if !mapped_predicates.is_empty()
+                && !row_matches_predicates(mapped_predicates, &seg.cols, i)
+            {
+                continue;
+            }
+            out_ts.push(t);
+            for (cidx, col) in seg.cols.iter().enumerate() {
+                match (&mut out_cols[cidx], col) {
+                    (ColumnData::F64(dst), ColumnData::F64(src)) => dst.push(src[i]),
+                    (ColumnData::I64(dst), ColumnData::I64(src)) => dst.push(src[i]),
+                    (ColumnData::Bool(dst), ColumnData::Bool(src)) => dst.push(src[i]),
+                    (ColumnData::Utf8(dst), ColumnData::Utf8(src)) => dst.push(src[i].clone()),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "column type mismatch",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok((out_ts, out_cols))
+}
+
 fn entry_may_match_predicates(entry: &TableIndexEntry, preds: &[MappedPredicate]) -> bool {
     for pred in preds {
         let stats = match entry.col_stats.get(pred.col_idx) {
@@ -1861,6 +1955,121 @@ fn decode_name_prefix(payload: &[u8]) -> io::Result<(String, &[u8])> {
     Ok((name, &payload[2 + len..]))
 }
 
+struct EncodedColumn {
+    nulls: Option<Vec<u8>>,
+    codec: u8,
+    blob: Vec<u8>,
+}
+
+fn encode_column(col: &ColumnData, schema_col: &ColumnSchema) -> io::Result<EncodedColumn> {
+    match (col, schema_col.col_type) {
+        (ColumnData::F64(values), ColumnType::F64) => {
+            let nulls = build_null_bitmap(values);
+            let (codec, blob) = compress_f64_column_auto(values);
+            Ok(EncodedColumn { nulls, codec, blob })
+        }
+        (ColumnData::I64(values), ColumnType::I64) => {
+            let nulls = build_null_bitmap(values);
+            let mut raw: Vec<i64> = Vec::with_capacity(values.len());
+            for v in values {
+                raw.push(v.unwrap_or(0));
+            }
+            let blob = TimeSeriesCompressor::compress(&raw);
+            Ok(EncodedColumn {
+                nulls,
+                codec: TABLE_COL_I64_D2,
+                blob,
+            })
+        }
+        (ColumnData::Bool(values), ColumnType::Bool) => {
+            let nulls = build_null_bitmap(values);
+            let mut raw = vec![0u8; (values.len() + 7) / 8];
+            for (i, v) in values.iter().enumerate() {
+                if v.unwrap_or(false) {
+                    let byte = i / 8;
+                    let bit = i % 8;
+                    raw[byte] |= 1u8 << bit;
+                }
+            }
+            Ok(EncodedColumn {
+                nulls,
+                codec: TABLE_COL_BOOL,
+                blob: raw,
+            })
+        }
+        (ColumnData::Utf8(values), ColumnType::Utf8) => {
+            let nulls = build_null_bitmap(values);
+            let mut dict: Vec<String> = Vec::new();
+            let mut dict_map: HashMap<String, u32> = HashMap::new();
+            let mut indices: Vec<u32> = Vec::with_capacity(values.len());
+            for v in values {
+                if let Some(s) = v {
+                    if let Some(idx) = dict_map.get(s) {
+                        indices.push(*idx);
+                    } else {
+                        let idx = dict.len() as u32;
+                        dict.push(s.clone());
+                        dict_map.insert(s.clone(), idx);
+                        indices.push(idx);
+                    }
+                } else {
+                    indices.push(0);
+                }
+            }
+            let dict_count = checked_u32_len(dict.len(), "utf8 dict exceeds u32::MAX")?;
+            let mut dict_offsets: Vec<u32> = Vec::with_capacity(dict.len() + 1);
+            let mut dict_bytes: Vec<u8> = Vec::new();
+            dict_offsets.push(0);
+            for s in &dict {
+                let bytes = s.as_bytes();
+                if dict_bytes.len() + bytes.len() > u32::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "utf8 dict bytes exceed u32::MAX",
+                    ));
+                }
+                dict_bytes.extend_from_slice(bytes);
+                dict_offsets.push(dict_bytes.len() as u32);
+            }
+            let offsets_bytes_len = dict_offsets
+                .len()
+                .checked_mul(4)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+            let indices_bytes_len = indices
+                .len()
+                .checked_mul(4)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+            let blob_len = 4usize
+                .checked_add(offsets_bytes_len)
+                .and_then(|v| v.checked_add(dict_bytes.len()))
+                .and_then(|v| v.checked_add(indices_bytes_len))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+            let blob_len_u32 = checked_u32_len(blob_len, "utf8 column bytes exceed u32::MAX")?;
+            let mut blob = Vec::with_capacity(blob_len);
+            blob.extend_from_slice(&dict_count.to_le_bytes());
+            for off in dict_offsets {
+                blob.extend_from_slice(&off.to_le_bytes());
+            }
+            blob.extend_from_slice(&dict_bytes);
+            for idx in indices {
+                blob.extend_from_slice(&idx.to_le_bytes());
+            }
+            if blob.len() != blob_len_u32 as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "utf8 column length mismatch",
+                ));
+            }
+            Ok(EncodedColumn {
+                nulls,
+                codec: TABLE_COL_UTF8,
+                blob,
+            })
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "schema mismatch")),
+    }
+}
+
 fn encode_table_segment(
     schema: &TableSchema,
     ts_ms: &[i64],
@@ -1909,137 +2118,22 @@ fn encode_table_segment(
     out.extend_from_slice(&ts_len.to_le_bytes());
     out.extend_from_slice(&ts_bytes);
     out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
-    for (col, schema_col) in cols.iter().zip(schema.columns.iter()) {
-        match (col, schema_col.col_type) {
-            (ColumnData::F64(values), ColumnType::F64) => {
-                let nulls = build_null_bitmap(values);
-                let (codec, blob) = compress_f64_column_auto(values);
-                if let Some(nulls) = nulls {
-                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
-                    out.extend_from_slice(&null_len.to_le_bytes());
-                    out.extend_from_slice(&nulls);
-                } else {
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                }
-                out.push(codec);
-                let blob_len = checked_u32_len(blob.len(), "column bytes exceed u32::MAX")?;
-                out.extend_from_slice(&blob_len.to_le_bytes());
-                out.extend_from_slice(&blob);
-            }
-            (ColumnData::I64(values), ColumnType::I64) => {
-                let nulls = build_null_bitmap(values);
-                let mut raw: Vec<i64> = Vec::with_capacity(values.len());
-                for v in values {
-                    raw.push(v.unwrap_or(0));
-                }
-                let blob = TimeSeriesCompressor::compress(&raw);
-                if let Some(nulls) = nulls {
-                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
-                    out.extend_from_slice(&null_len.to_le_bytes());
-                    out.extend_from_slice(&nulls);
-                } else {
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                }
-                out.push(TABLE_COL_I64_D2);
-                let blob_len = checked_u32_len(blob.len(), "column bytes exceed u32::MAX")?;
-                out.extend_from_slice(&blob_len.to_le_bytes());
-                out.extend_from_slice(&blob);
-            }
-            (ColumnData::Bool(values), ColumnType::Bool) => {
-                let nulls = build_null_bitmap(values);
-                let mut raw = vec![0u8; (values.len() + 7) / 8];
-                for (i, v) in values.iter().enumerate() {
-                    if v.unwrap_or(false) {
-                        let byte = i / 8;
-                        let bit = i % 8;
-                        raw[byte] |= 1u8 << bit;
-                    }
-                }
-                if let Some(nulls) = nulls {
-                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
-                    out.extend_from_slice(&null_len.to_le_bytes());
-                    out.extend_from_slice(&nulls);
-                } else {
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                }
-                out.push(TABLE_COL_BOOL);
-                let raw_len = checked_u32_len(raw.len(), "bool bytes exceed u32::MAX")?;
-                out.extend_from_slice(&raw_len.to_le_bytes());
-                out.extend_from_slice(&raw);
-            }
-            (ColumnData::Utf8(values), ColumnType::Utf8) => {
-                let nulls = build_null_bitmap(values);
-                let mut dict: Vec<String> = Vec::new();
-                let mut dict_map: HashMap<String, u32> = HashMap::new();
-                let mut indices: Vec<u32> = Vec::with_capacity(values.len());
-                for v in values {
-                    if let Some(s) = v {
-                        if let Some(idx) = dict_map.get(s) {
-                            indices.push(*idx);
-                        } else {
-                            let idx = dict.len() as u32;
-                            dict.push(s.clone());
-                            dict_map.insert(s.clone(), idx);
-                            indices.push(idx);
-                        }
-                    } else {
-                        indices.push(0);
-                    }
-                }
-                let dict_count = checked_u32_len(dict.len(), "utf8 dict exceeds u32::MAX")?;
-                let mut dict_offsets: Vec<u32> = Vec::with_capacity(dict.len() + 1);
-                let mut dict_bytes: Vec<u8> = Vec::new();
-                dict_offsets.push(0);
-                for s in &dict {
-                    let bytes = s.as_bytes();
-                    if dict_bytes.len() + bytes.len() > u32::MAX as usize {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "utf8 dict bytes exceed u32::MAX",
-                        ));
-                    }
-                    dict_bytes.extend_from_slice(bytes);
-                    dict_offsets.push(dict_bytes.len() as u32);
-                }
-                let offsets_bytes_len = dict_offsets
-                    .len()
-                    .checked_mul(4)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
-                let indices_bytes_len = indices
-                    .len()
-                    .checked_mul(4)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
-                let blob_len = 4usize
-                    .checked_add(offsets_bytes_len)
-                    .and_then(|v| v.checked_add(dict_bytes.len()))
-                    .and_then(|v| v.checked_add(indices_bytes_len))
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
-                let blob_len_u32 =
-                    checked_u32_len(blob_len, "utf8 column bytes exceed u32::MAX")?;
-                let mut blob = Vec::with_capacity(blob_len);
-                blob.extend_from_slice(&dict_count.to_le_bytes());
-                for off in dict_offsets {
-                    blob.extend_from_slice(&off.to_le_bytes());
-                }
-                blob.extend_from_slice(&dict_bytes);
-                for idx in indices {
-                    blob.extend_from_slice(&idx.to_le_bytes());
-                }
-                if let Some(nulls) = nulls {
-                    let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
-                    out.extend_from_slice(&null_len.to_le_bytes());
-                    out.extend_from_slice(&nulls);
-                } else {
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                }
-                out.push(TABLE_COL_UTF8);
-                out.extend_from_slice(&blob_len_u32.to_le_bytes());
-                out.extend_from_slice(&blob);
-            }
-            _ => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "schema mismatch"));
-            }
+    let encoded: Vec<EncodedColumn> = (0..cols.len())
+        .into_par_iter()
+        .map(|idx| encode_column(&cols[idx], &schema.columns[idx]))
+        .collect::<Result<_, _>>()?;
+    for col in encoded {
+        if let Some(nulls) = col.nulls {
+            let null_len = checked_u32_len(nulls.len(), "null bitmap exceeds u32::MAX")?;
+            out.extend_from_slice(&null_len.to_le_bytes());
+            out.extend_from_slice(&nulls);
+        } else {
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
+        out.push(col.codec);
+        let blob_len = checked_u32_len(col.blob.len(), "column bytes exceed u32::MAX")?;
+        out.extend_from_slice(&blob_len.to_le_bytes());
+        out.extend_from_slice(&col.blob);
     }
     Ok(out)
 }

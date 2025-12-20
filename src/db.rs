@@ -1346,6 +1346,32 @@ impl NanoTsDb {
         )
     }
 
+    #[cfg(feature = "datafusion")]
+    pub fn query_table_range_typed_snapshot_partitions_with_predicates(
+        &self,
+        table: &str,
+        start_ms: i64,
+        end_ms: i64,
+        predicates: &[ColumnPredicate],
+        partitions: usize,
+    ) -> io::Result<Vec<(Vec<i64>, Vec<ColumnData>)>> {
+        let effective_start = match self.retention_cutoff_ms() {
+            Some(cutoff) => start_ms.max(cutoff),
+            None => start_ms,
+        };
+        let schema = self.storage.read_table_schema(table)?;
+        let snapshot_end = self.storage.file_len()?;
+        self.storage.read_table_columns_in_range_filtered_partitions_with_limit(
+            table,
+            &schema,
+            effective_start,
+            end_ms,
+            predicates,
+            Some(snapshot_end),
+            partitions,
+        )
+    }
+
     fn retention_cutoff_ms(&self) -> Option<i64> {
         let retention_ms = self.meta.retention_ms?;
         Some(now_ms().saturating_sub(retention_ms))

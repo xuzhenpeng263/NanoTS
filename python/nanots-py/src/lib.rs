@@ -8,10 +8,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyString};
 #[cfg(feature = "arrow")]
 use pyo3::types::PyCapsule;
+#[cfg(feature = "datafusion")]
+use pyo3_asyncio::tokio::future_into_py;
 use std::sync::Mutex;
 use std::time::Duration;
 #[cfg(feature = "arrow")]
 use std::ffi::c_void;
+#[cfg(feature = "datafusion")]
+use tokio::task;
 
 #[cfg(feature = "arrow")]
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, StructArray};
@@ -360,10 +364,14 @@ impl Db {
     /// Import in Python with `pyarrow.RecordBatchReader._import_from_c_capsule(capsule)`.
     #[cfg(feature = "datafusion")]
     fn query_sql_arrow_stream_capsule(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
-        use arrow::ffi_stream::FFI_ArrowArrayStream;
-        use datafusion::arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
-        use std::sync::Arc;
+        let batches = self.query_sql_batches(sql)?;
+        build_arrow_stream_capsule(py, batches)
+    }
 
+    #[cfg(feature = "datafusion")]
+    fn query_sql_async<'p>(&self, py: Python<'p>, sql: &str) -> PyResult<&'p PyAny> {
+        let path = self.path.clone();
+        let sql = sql.to_string();
         {
             let mut db = self
                 .inner
@@ -372,41 +380,44 @@ impl Db {
             db.flush()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
-        let db = Arc::new(
-            NanoTsDb::open(&self.path, NanoTsOptions::default())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        );
-        let batches = nanots_core::datafusion::query_sql(db, sql)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        future_into_py(py, async move {
+            let batches = task::spawn_blocking(move || {
+                let db = std::sync::Arc::new(
+                    NanoTsDb::open(&path, NanoTsOptions::default())
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                );
+                nanots_core::datafusion::query_sql(db, &sql)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("sql task failed: {e}")))??;
+            Python::with_gil(|py| build_arrow_stream_capsule(py, batches))
+        })
+    }
 
-        let schema = batches
-            .get(0)
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
-        let stream = Box::new(FFI_ArrowArrayStream::new(reader));
+    #[cfg(feature = "datafusion")]
+    fn query_sql_to_pandas(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        let capsule = self.query_sql_arrow_stream_capsule(py, sql)?;
+        let pyarrow = py.import("pyarrow")?;
+        let reader = pyarrow
+            .getattr("RecordBatchReader")?
+            .call_method1("_import_from_c_capsule", (capsule,))?;
+        let table = reader.call_method0("read_all")?;
+        let df = table.call_method0("to_pandas")?;
+        Ok(df.into())
+    }
 
-        unsafe extern "C" fn capsule_destructor_stream(capsule: *mut pyo3::ffi::PyObject) {
-            let ptr =
-                pyo3::ffi::PyCapsule_GetPointer(capsule, b"arrow_array_stream\0".as_ptr() as *const _);
-            if !ptr.is_null() {
-                drop(Box::from_raw(ptr as *mut FFI_ArrowArrayStream));
-            }
-        }
-
-        let stream_ptr = Box::into_raw(stream) as *mut std::ffi::c_void;
-        let stream_capsule = unsafe {
-            PyObject::from_owned_ptr(
-                py,
-                pyo3::ffi::PyCapsule_New(
-                    stream_ptr,
-                    b"arrow_array_stream\0".as_ptr() as *const _,
-                    Some(capsule_destructor_stream),
-                ),
-            )
-        };
-        Ok(stream_capsule)
+    #[cfg(feature = "datafusion")]
+    fn query_sql_to_polars(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        let capsule = self.query_sql_arrow_stream_capsule(py, sql)?;
+        let pyarrow = py.import("pyarrow")?;
+        let reader = pyarrow
+            .getattr("RecordBatchReader")?
+            .call_method1("_import_from_c_capsule", (capsule,))?;
+        let table = reader.call_method0("read_all")?;
+        let polars = py.import("polars")?;
+        let df = polars.call_method1("from_arrow", (table,))?;
+        Ok(df.into())
     }
 
     fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
@@ -505,6 +516,68 @@ impl Db {
             None => Ok(py.None()),
         }
     }
+}
+
+#[cfg(feature = "datafusion")]
+impl Db {
+    fn query_sql_batches(
+        &self,
+        sql: &str,
+    ) -> PyResult<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+        {
+            let mut db = self
+                .inner
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("db lock poisoned"))?;
+            db.flush()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        let db = std::sync::Arc::new(
+            NanoTsDb::open(&self.path, NanoTsOptions::default())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        );
+        nanots_core::datafusion::query_sql(db, sql)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+#[cfg(feature = "datafusion")]
+fn build_arrow_stream_capsule(
+    py: Python<'_>,
+    batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+) -> PyResult<PyObject> {
+    use arrow::ffi_stream::FFI_ArrowArrayStream;
+    use datafusion::arrow::record_batch::{RecordBatchIterator, RecordBatchReader};
+    use std::sync::Arc;
+
+    let schema = batches
+        .get(0)
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+    let stream = Box::new(FFI_ArrowArrayStream::new(reader));
+
+    unsafe extern "C" fn capsule_destructor_stream(capsule: *mut pyo3::ffi::PyObject) {
+        let ptr =
+            pyo3::ffi::PyCapsule_GetPointer(capsule, b"arrow_array_stream\0".as_ptr() as *const _);
+        if !ptr.is_null() {
+            drop(Box::from_raw(ptr as *mut FFI_ArrowArrayStream));
+        }
+    }
+
+    let stream_ptr = Box::into_raw(stream) as *mut std::ffi::c_void;
+    let stream_capsule = unsafe {
+        PyObject::from_owned_ptr(
+            py,
+            pyo3::ffi::PyCapsule_New(
+                stream_ptr,
+                b"arrow_array_stream\0".as_ptr() as *const _,
+                Some(capsule_destructor_stream),
+            ),
+        )
+    };
+    Ok(stream_capsule)
 }
 
 fn parse_auto_maintenance(
