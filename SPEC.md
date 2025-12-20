@@ -10,6 +10,7 @@ The database is a single file (typically `*.ntt`) with this header:
 
 - `magic`: 4 bytes = `NTSF`
 - `version`: u8 = `1`
+- `footer_offset`: u64 (`0` means no footer)
 
 After the header, the file is a sequence of **records**:
 
@@ -29,6 +30,7 @@ Record types:
 - `5` = WAL checkpoint
 - `6` = Series segment (legacy single-column)
 - `7` = Table index (persisted)
+- `8` = Footer
 
 ### Meta record (type = 1)
 
@@ -82,6 +84,46 @@ Payload:
 - `name_len`: u16
 - `name_bytes`: `name_len` bytes (UTF-8 table name)
 - `index_bytes`: see **Table index payload** below
+
+#### Table index payload
+
+- `magic`: 4 bytes = `NTSI`
+- `version`: u8 = `1`
+- `count`: u32 (segments)
+
+Then repeated `count` times:
+
+- `offset`: u64 (segment offset)
+- `len`: u64 (segment length)
+- `min_ts`: i64
+- `max_ts`: i64
+- `min_seq`: u64
+- `max_seq`: u64
+- `count`: u32
+- Per column (schema order):
+  - `has_stats`: u8 (`0` or `1`)
+  - If column is `F64`: `min`: f64, `max`: f64
+  - If column is `I64`: `min`: i64, `max`: i64
+  - If column is `Bool`: `min`: u8, `max`: u8
+  - If column is `Utf8`: `min_len`: u32, `max_len`: u32
+
+### Footer record (type = 8)
+
+Payload:
+
+- `magic`: 4 bytes = `NTSF`
+- `version`: u8 = `1`
+- `meta_offset`: u64 (`0` means none)
+- `schema_count`: u32
+- For each schema:
+  - `name_len`: u16
+  - `name_bytes`: `name_len` bytes (UTF-8 table name)
+  - `record_offset`: u64 (schema record offset)
+- `index_count`: u32
+- For each index:
+  - `name_len`: u16
+  - `name_bytes`: `name_len` bytes (UTF-8 table name)
+  - `record_offset`: u64 (index record offset)
 
 ## Schema payload
 
@@ -181,9 +223,9 @@ Header:
 
 - `magic`: 4 bytes = `NTSI`
 - `version`: u8 = `1`
-- `entry_count`: u32
+- `count`: u32 (segments)
 
-Then repeated `entry_count` times:
+Then repeated `count` times:
 
 - `offset`: u64 (segment offset inside `.ntt`)
 - `len`: u64 (segment length bytes)
@@ -192,3 +234,9 @@ Then repeated `entry_count` times:
 - `min_seq`: u64
 - `max_seq`: u64
 - `count`: u32 (rows in segment)
+- Per column (schema order):
+  - `has_stats`: u8 (`0` or `1`)
+  - If column is `F64`: `min`: f64, `max`: f64
+  - If column is `I64`: `min`: i64, `max`: i64
+  - If column is `Bool`: `min`: u8, `max`: u8
+  - If column is `Utf8`: `min_len`: u32, `max_len`: u32

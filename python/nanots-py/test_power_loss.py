@@ -38,6 +38,8 @@ def run_supervisor(args: argparse.Namespace) -> int:
             str(args.max_writes),
             "--expected-sync-every",
             str(args.expected_sync_every),
+            "--max-file-bytes",
+            str(args.max_file_bytes),
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         delay_ms = rng.randrange(args.kill_min_ms, max(args.kill_max_ms, args.kill_min_ms) + 1)
@@ -45,7 +47,9 @@ def run_supervisor(args: argparse.Namespace) -> int:
         proc.kill()
         proc.wait()
 
-        verify_db(path, expected_path)
+        if args.corrupt_bytes > 0 and rng.random() < args.corrupt_prob:
+            corrupt_file(path, rng, args.corrupt_bytes)
+        verify_db(path, expected_path, args.allow_corruption)
         expected_count = len(read_expected(expected_path))
         print(f"round {round_idx + 1} ok: expected_rows={expected_count}")
 
@@ -66,6 +70,9 @@ def run_writer(args: argparse.Namespace) -> int:
     os.makedirs(os.path.dirname(expected_path) or ".", exist_ok=True)
     with open(expected_path, "a", encoding="utf-8") as expected:
         for i in range(args.max_writes):
+            if args.max_file_bytes > 0 and os.path.exists(path):
+                if os.path.getsize(path) >= args.max_file_bytes:
+                    break
             seq = start_seq + i
             db.append_row("t", seq, [float(seq)])
             expected.write(f"{seq}\n")
@@ -75,14 +82,19 @@ def run_writer(args: argparse.Namespace) -> int:
     return 0
 
 
-def verify_db(path: str, expected_path: str) -> None:
+def verify_db(path: str, expected_path: str, allow_corruption: bool) -> None:
     expected = read_expected(expected_path)
     if not expected:
         return
     max_ts = expected[-1]
 
     db = nanots.Db(path)
-    ts, cols = db.query_table_range_columns("t", 0, max_ts)
+    try:
+        ts, cols = db.query_table_range_columns("t", 0, max_ts)
+    except Exception:
+        if allow_corruption:
+            return
+        raise
     if len(cols) != 1 or len(ts) != len(cols[0]):
         raise RuntimeError("column length mismatch")
 
@@ -144,11 +156,40 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--kill-min-ms", type=int, default=50)
     parser.add_argument("--kill-max-ms", type=int, default=200)
     parser.add_argument("--expected-sync-every", type=int, default=1)
+    parser.add_argument("--max-file-bytes", type=int, default=0)
+    parser.add_argument("--corrupt-bytes", type=int, default=0)
+    parser.add_argument("--corrupt-prob", type=float, default=0.0)
+    parser.add_argument("--allow-corruption", action="store_true")
     parser.add_argument("--reset", action="store_true")
     args = parser.parse_args(argv)
     if args.expected_sync_every < 1:
         args.expected_sync_every = 1
+    if args.corrupt_prob < 0:
+        args.corrupt_prob = 0.0
+    if args.corrupt_prob > 1:
+        args.corrupt_prob = 1.0
     return args
+
+
+def corrupt_file(path: str, rng: random.Random, bytes_to_flip: int) -> None:
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    if size == 0:
+        return
+    with open(path, "r+b") as f:
+        for _ in range(bytes_to_flip):
+            offset = rng.randrange(0, size)
+            f.seek(offset)
+            b = f.read(1)
+            if not b:
+                continue
+            val = b[0]
+            bit = 1 << rng.randrange(0, 8)
+            f.seek(offset)
+            f.write(bytes([val ^ bit]))
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def main(argv: list[str]) -> int:

@@ -2,7 +2,7 @@
 
 use crate::compressor::TimeSeriesCompressor;
 use crate::compressor::{compress_f64_xor, decompress_f64_xor};
-use crate::db::{ColumnData, ColumnSchema, ColumnType, Point, TableSchema};
+use crate::db::{ColumnData, ColumnPredicate, ColumnPredicateOp, ColumnPredicateValue, ColumnSchema, ColumnType, Point, TableSchema};
 use crate::dbfile;
 use memmap2::MmapOptions;
 use std::collections::HashMap;
@@ -31,6 +31,9 @@ const META_VERSION: u8 = 1;
 const TABLE_INDEX_MAGIC: &[u8; 4] = b"NTSI";
 const TABLE_INDEX_VERSION: u8 = 1;
 
+const FOOTER_MAGIC: &[u8; 4] = b"NTSF";
+const FOOTER_VERSION: u8 = 1;
+
 #[derive(Debug, Clone)]
 pub struct Storage {
     path: PathBuf,
@@ -41,8 +44,11 @@ pub struct Storage {
 struct StorageState {
     schemas: HashMap<String, TableSchema>,
     schema_bytes: HashMap<String, u64>,
+    schema_offsets: HashMap<String, u64>,
     table_index: HashMap<String, Vec<TableIndexEntry>>,
     index_bytes: HashMap<String, u64>,
+    index_offsets: HashMap<String, u64>,
+    meta_offset: Option<u64>,
     max_seq: u64,
 }
 
@@ -68,7 +74,11 @@ impl Storage {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         dbfile::ensure_db_file(&path)?;
-        let state = scan_db_file(&path)?;
+        let state = match load_state_from_footer(&path) {
+            Ok(Some(state)) => state,
+            Ok(None) => scan_db_file(&path)?,
+            Err(_) => scan_db_file(&path)?,
+        };
         Ok(Self {
             path,
             state: Arc::new(Mutex::new(state)),
@@ -120,12 +130,15 @@ impl Storage {
     pub fn write_table_schema(&self, table: &str, schema: &TableSchema) -> io::Result<()> {
         let schema_bytes = encode_table_schema_bytes(schema)?;
         let payload = encode_named_payload(table, &schema_bytes)?;
-        let _ = dbfile::append_record(&self.path, dbfile::RECORD_SCHEMA, &payload)?;
+        let record_offset = dbfile::append_record(&self.path, dbfile::RECORD_SCHEMA, &payload)?;
 
         let mut state = self.state.lock().unwrap();
         state.schemas.insert(table.to_string(), schema.clone());
         state.schema_bytes
             .insert(table.to_string(), schema_bytes.len() as u64);
+        state
+            .schema_offsets
+            .insert(table.to_string(), record_offset);
         Ok(())
     }
 
@@ -147,6 +160,13 @@ impl Storage {
     }
 
     pub fn read_latest_meta(&self) -> io::Result<Option<(u64, Option<i64>)>> {
+        if let Some(offset) = self.state.lock().unwrap().meta_offset {
+            if let Ok((hdr, payload)) = dbfile::read_record_at(&self.path, offset) {
+                if hdr.record_type == dbfile::RECORD_META {
+                    return Ok(Some(decode_meta_payload(&payload)?));
+                }
+            }
+        }
         let mut out: Option<(u64, Option<i64>)> = None;
         dbfile::iter_records(&self.path, |hdr, payload| {
             if hdr.record_type != dbfile::RECORD_META {
@@ -161,9 +181,28 @@ impl Storage {
 
     pub fn write_meta(&self, last_seq: u64, retention_ms: Option<i64>) -> io::Result<()> {
         let payload = encode_meta_payload(last_seq, retention_ms);
-        let _ = dbfile::append_record(&self.path, dbfile::RECORD_META, &payload)?;
+        let record_offset = dbfile::append_record(&self.path, dbfile::RECORD_META, &payload)?;
         let mut state = self.state.lock().unwrap();
         state.max_seq = state.max_seq.max(last_seq);
+        state.meta_offset = Some(record_offset);
+        Ok(())
+    }
+
+    pub fn write_footer(&self) -> io::Result<()> {
+        let (meta_offset, schema_offsets, index_offsets) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.meta_offset,
+                state.schema_offsets.clone(),
+                state.index_offsets.clone(),
+            )
+        };
+        if meta_offset.is_none() && schema_offsets.is_empty() && index_offsets.is_empty() {
+            return Ok(());
+        }
+        let payload = encode_footer_payload(meta_offset, &schema_offsets, &index_offsets)?;
+        let record_offset = dbfile::append_record(&self.path, dbfile::RECORD_FOOTER, &payload)?;
+        dbfile::write_footer_offset(&self.path, record_offset)?;
         Ok(())
     }
 
@@ -227,6 +266,7 @@ impl Storage {
         let name_len = table.as_bytes().len() as u64;
         let segment_offset = record_offset + 5 + 2 + name_len;
         let header = parse_table_segment_header(&segment_bytes)?;
+        let col_stats = column_stats_from_cols(schema, cols);
 
         let mut state = self.state.lock().unwrap();
         state
@@ -241,30 +281,37 @@ impl Storage {
                 min_seq: header.min_seq,
                 max_seq: header.max_seq,
                 count: header.count,
+                col_stats,
             });
         state.max_seq = state.max_seq.max(min_seq).max(max_seq);
         Ok(())
     }
 
     pub fn write_table_index(&self, table: &str) -> io::Result<()> {
-        let entries = {
+        let (entries, schema) = {
             let state = self.state.lock().unwrap();
-            state
-                .table_index
+            let entries = state.table_index.get(table).cloned().unwrap_or_default();
+            let schema = state
+                .schemas
                 .get(table)
                 .cloned()
-                .unwrap_or_default()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "table schema not found"))?;
+            (entries, schema)
         };
         if entries.is_empty() {
             return Ok(());
         }
-        let index_bytes = encode_table_index_payload(&entries);
+        let index_bytes = encode_table_index_payload(&entries, &schema)?;
         let payload = encode_named_payload(table, &index_bytes)?;
-        let _ = dbfile::append_record(&self.path, dbfile::RECORD_TABLE_INDEX, &payload)?;
+        let record_offset =
+            dbfile::append_record(&self.path, dbfile::RECORD_TABLE_INDEX, &payload)?;
         let mut state = self.state.lock().unwrap();
         state
             .index_bytes
             .insert(table.to_string(), payload.len() as u64);
+        state
+            .index_offsets
+            .insert(table.to_string(), record_offset);
         Ok(())
     }
 
@@ -341,6 +388,7 @@ impl Storage {
         std::fs::rename(&tmp, &self.path)?;
         let new_state = scan_db_file(&self.path)?;
         *self.state.lock().unwrap() = new_state;
+        self.write_footer()?;
         Ok(())
     }
 
@@ -350,6 +398,17 @@ impl Storage {
         schema: &TableSchema,
         start_ms: i64,
         end_ms: i64,
+    ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
+        self.read_table_columns_in_range_filtered(table, schema, start_ms, end_ms, &[])
+    }
+
+    pub fn read_table_columns_in_range_filtered(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        start_ms: i64,
+        end_ms: i64,
+        predicates: &[ColumnPredicate],
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
         let index = self.load_or_rebuild_table_index(table)?;
         if index.is_empty() {
@@ -379,9 +438,13 @@ impl Storage {
                 ColumnType::Utf8 => ColumnData::Utf8(Vec::new()),
             })
             .collect();
+        let mapped_predicates = map_predicates(schema, predicates);
 
         for e in index {
             if e.max_ts < start_ms || e.min_ts > end_ms {
+                continue;
+            }
+            if !mapped_predicates.is_empty() && !entry_may_match_predicates(&e, &mapped_predicates) {
                 continue;
             }
             let off = e.offset as usize;
@@ -533,6 +596,7 @@ impl Storage {
         let new_state = scan_db_file(&self.path)?;
         *self.state.lock().unwrap() = new_state;
         self.write_table_index(table)?;
+        self.write_footer()?;
         Ok(())
     }
 
@@ -547,6 +611,7 @@ impl Storage {
     }
 
     fn rebuild_table_index(&self, table: &str) -> io::Result<Vec<TableIndexEntry>> {
+        let schema = self.read_table_schema(table)?;
         let mut idx = Vec::new();
         dbfile::iter_records(&self.path, |hdr, payload| {
             if hdr.record_type != dbfile::RECORD_TABLE_SEGMENT {
@@ -557,6 +622,8 @@ impl Storage {
                 return Ok(());
             }
             let header = parse_table_segment_header(data)?;
+            let seg = read_table_segment_from_bytes(data, &schema)?;
+            let col_stats = column_stats_from_cols(&schema, &seg.cols);
             let name_len = name.as_bytes().len() as u64;
             let segment_offset = hdr.payload_offset + 2 + name_len;
             idx.push(TableIndexEntry {
@@ -567,6 +634,7 @@ impl Storage {
                 min_seq: header.min_seq,
                 max_seq: header.max_seq,
                 count: header.count,
+                col_stats,
             });
             Ok(())
         })?;
@@ -679,7 +747,7 @@ impl Storage {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TableIndexEntry {
     offset: u64,
     len: u64,
@@ -688,6 +756,15 @@ struct TableIndexEntry {
     min_seq: u64,
     max_seq: u64,
     count: u32,
+    col_stats: Vec<Option<ColumnStats>>,
+}
+
+#[derive(Debug, Clone)]
+enum ColumnStats {
+    F64 { min: f64, max: f64 },
+    I64 { min: i64, max: i64 },
+    Bool { min: bool, max: bool },
+    Utf8 { min_len: u32, max_len: u32 },
 }
 
 #[derive(Debug)]
@@ -1028,6 +1105,199 @@ fn checked_u32_len(len: usize, what: &str) -> io::Result<u32> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, what));
     }
     Ok(len as u32)
+}
+
+fn column_stats_from_cols(schema: &TableSchema, cols: &[ColumnData]) -> Vec<Option<ColumnStats>> {
+    let mut out = Vec::with_capacity(schema.columns.len());
+    for (col_schema, col) in schema.columns.iter().zip(cols.iter()) {
+        let stats = match (col_schema.col_type, col) {
+            (ColumnType::F64, ColumnData::F64(values)) => stats_f64(values),
+            (ColumnType::I64, ColumnData::I64(values)) => stats_i64(values),
+            (ColumnType::Bool, ColumnData::Bool(values)) => stats_bool(values),
+            (ColumnType::Utf8, ColumnData::Utf8(values)) => stats_utf8(values),
+            _ => None,
+        };
+        out.push(stats);
+    }
+    out
+}
+
+fn stats_f64(values: &[Option<f64>]) -> Option<ColumnStats> {
+    let mut min: Option<f64> = None;
+    let mut max: Option<f64> = None;
+    for v in values {
+        let v = match v {
+            Some(v) => *v,
+            None => continue,
+        };
+        if v.is_nan() {
+            return None;
+        }
+        min = Some(match min {
+            Some(cur) => cur.min(v),
+            None => v,
+        });
+        max = Some(match max {
+            Some(cur) => cur.max(v),
+            None => v,
+        });
+    }
+    min.zip(max)
+        .map(|(min, max)| ColumnStats::F64 { min, max })
+}
+
+fn stats_i64(values: &[Option<i64>]) -> Option<ColumnStats> {
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for v in values {
+        let v = match v {
+            Some(v) => *v,
+            None => continue,
+        };
+        min = Some(match min {
+            Some(cur) => cur.min(v),
+            None => v,
+        });
+        max = Some(match max {
+            Some(cur) => cur.max(v),
+            None => v,
+        });
+    }
+    min.zip(max)
+        .map(|(min, max)| ColumnStats::I64 { min, max })
+}
+
+fn stats_bool(values: &[Option<bool>]) -> Option<ColumnStats> {
+    let mut seen_true = false;
+    let mut seen_false = false;
+    for v in values {
+        match v {
+            Some(true) => seen_true = true,
+            Some(false) => seen_false = true,
+            None => {}
+        }
+    }
+    if !seen_true && !seen_false {
+        return None;
+    }
+    let min = if seen_false { false } else { true };
+    let max = if seen_true { true } else { false };
+    Some(ColumnStats::Bool { min, max })
+}
+
+fn stats_utf8(values: &[Option<String>]) -> Option<ColumnStats> {
+    let mut min: Option<u32> = None;
+    let mut max: Option<u32> = None;
+    for v in values {
+        let s = match v {
+            Some(s) => s,
+            None => continue,
+        };
+        let len = s.len();
+        let len = match checked_u32_len(len, "utf8 length exceeds u32::MAX") {
+            Ok(len) => len,
+            Err(_) => return None,
+        };
+        min = Some(match min {
+            Some(cur) => cur.min(len),
+            None => len,
+        });
+        max = Some(match max {
+            Some(cur) => cur.max(len),
+            None => len,
+        });
+    }
+    min.zip(max)
+        .map(|(min_len, max_len)| ColumnStats::Utf8 { min_len, max_len })
+}
+
+#[derive(Debug, Clone)]
+struct MappedPredicate {
+    col_idx: usize,
+    op: ColumnPredicateOp,
+    value: ColumnPredicateValue,
+}
+
+fn map_predicates(schema: &TableSchema, predicates: &[ColumnPredicate]) -> Vec<MappedPredicate> {
+    let mut out = Vec::new();
+    for pred in predicates {
+        let idx = match schema
+            .columns
+            .iter()
+            .position(|c| c.name == pred.column)
+        {
+            Some(idx) => idx,
+            None => continue,
+        };
+        let col_type = schema.columns[idx].col_type;
+        let matches = match (&pred.value, col_type) {
+            (ColumnPredicateValue::F64(_), ColumnType::F64) => true,
+            (ColumnPredicateValue::I64(_), ColumnType::I64) => true,
+            (ColumnPredicateValue::Bool(_), ColumnType::Bool) => true,
+            _ => false,
+        };
+        if !matches {
+            continue;
+        }
+        out.push(MappedPredicate {
+            col_idx: idx,
+            op: pred.op,
+            value: pred.value.clone(),
+        });
+    }
+    out
+}
+
+fn entry_may_match_predicates(entry: &TableIndexEntry, preds: &[MappedPredicate]) -> bool {
+    for pred in preds {
+        let stats = match entry.col_stats.get(pred.col_idx) {
+            Some(stats) => stats,
+            None => return true,
+        };
+        let stats = match stats {
+            Some(stats) => stats,
+            None => return true,
+        };
+        let ok = match (stats, &pred.value) {
+            (ColumnStats::F64 { min, max }, ColumnPredicateValue::F64(v)) => {
+                range_may_match(*min, *max, *v, pred.op)
+            }
+            (ColumnStats::I64 { min, max }, ColumnPredicateValue::I64(v)) => {
+                range_may_match(*min, *max, *v, pred.op)
+            }
+            (ColumnStats::Bool { min, max }, ColumnPredicateValue::Bool(v)) => {
+                bool_range_may_match(*min, *max, *v, pred.op)
+            }
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn range_may_match<T: PartialOrd + Copy>(min: T, max: T, value: T, op: ColumnPredicateOp) -> bool {
+    match op {
+        ColumnPredicateOp::Eq => value >= min && value <= max,
+        ColumnPredicateOp::Gt => max > value,
+        ColumnPredicateOp::GtEq => max >= value,
+        ColumnPredicateOp::Lt => min < value,
+        ColumnPredicateOp::LtEq => min <= value,
+    }
+}
+
+fn bool_range_may_match(min: bool, max: bool, value: bool, op: ColumnPredicateOp) -> bool {
+    let min = min as u8;
+    let max = max as u8;
+    let value = value as u8;
+    match op {
+        ColumnPredicateOp::Eq => value >= min && value <= max,
+        ColumnPredicateOp::Gt => max > value,
+        ColumnPredicateOp::GtEq => max >= value,
+        ColumnPredicateOp::Lt => min < value,
+        ColumnPredicateOp::LtEq => min <= value,
+    }
 }
 
 fn is_valid(bitmap: &[u8], idx: usize) -> bool {
@@ -1533,12 +1803,132 @@ fn decode_meta_payload(payload: &[u8]) -> io::Result<(u64, Option<i64>)> {
     Ok((last_seq, retention_ms))
 }
 
-fn encode_table_index_payload(entries: &[TableIndexEntry]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 4 + entries.len() * (8 + 8 + 8 + 8 + 8 + 8 + 4));
+#[derive(Debug)]
+struct FooterPayload {
+    meta_offset: Option<u64>,
+    schema_offsets: HashMap<String, u64>,
+    index_offsets: HashMap<String, u64>,
+}
+
+fn encode_footer_payload(
+    meta_offset: Option<u64>,
+    schema_offsets: &HashMap<String, u64>,
+    index_offsets: &HashMap<String, u64>,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(FOOTER_MAGIC);
+    out.push(FOOTER_VERSION);
+    out.extend_from_slice(&meta_offset.unwrap_or(0).to_le_bytes());
+
+    let mut schema_keys: Vec<&String> = schema_offsets.keys().collect();
+    schema_keys.sort();
+    let schema_count = checked_u32_len(schema_keys.len(), "schema count exceeds u32::MAX")?;
+    out.extend_from_slice(&schema_count.to_le_bytes());
+    for name in schema_keys {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "schema name too long for footer",
+            ));
+        }
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        let offset = schema_offsets.get(name).copied().unwrap_or(0);
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    let mut index_keys: Vec<&String> = index_offsets.keys().collect();
+    index_keys.sort();
+    let index_count = checked_u32_len(index_keys.len(), "index count exceeds u32::MAX")?;
+    out.extend_from_slice(&index_count.to_le_bytes());
+    for name in index_keys {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index name too long for footer",
+            ));
+        }
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        let offset = index_offsets.get(name).copied().unwrap_or(0);
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    Ok(out)
+}
+
+fn decode_footer_payload(payload: &[u8]) -> io::Result<FooterPayload> {
+    let mut pos = 0usize;
+    let mut read_exact = |len: usize| -> io::Result<&[u8]> {
+        if payload.len() < pos + len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "footer payload too short",
+            ));
+        }
+        let out = &payload[pos..pos + len];
+        pos += len;
+        Ok(out)
+    };
+
+    let magic = read_exact(4)?;
+    if magic != FOOTER_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad footer magic"));
+    }
+    let version = read_exact(1)?[0];
+    if version != FOOTER_VERSION {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad footer version"));
+    }
+    let meta_offset = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+    let meta_offset = if meta_offset == 0 { None } else { Some(meta_offset) };
+
+    let schema_count = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+    let mut schema_offsets = HashMap::with_capacity(schema_count);
+    for _ in 0..schema_count {
+        let name_len = u16::from_le_bytes(read_exact(2)?.try_into().unwrap()) as usize;
+        let name = std::str::from_utf8(read_exact(name_len)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid footer name"))?
+            .to_string();
+        let offset = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        schema_offsets.insert(name, offset);
+    }
+
+    let index_count = u32::from_le_bytes(read_exact(4)?.try_into().unwrap()) as usize;
+    let mut index_offsets = HashMap::with_capacity(index_count);
+    for _ in 0..index_count {
+        let name_len = u16::from_le_bytes(read_exact(2)?.try_into().unwrap()) as usize;
+        let name = std::str::from_utf8(read_exact(name_len)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid footer name"))?
+            .to_string();
+        let offset = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+        index_offsets.insert(name, offset);
+    }
+
+    Ok(FooterPayload {
+        meta_offset,
+        schema_offsets,
+        index_offsets,
+    })
+}
+
+fn encode_table_index_payload(
+    entries: &[TableIndexEntry],
+    schema: &TableSchema,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
     out.extend_from_slice(TABLE_INDEX_MAGIC);
     out.push(TABLE_INDEX_VERSION);
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let count = checked_u32_len(entries.len(), "index entry count exceeds u32::MAX")?;
+    out.extend_from_slice(&count.to_le_bytes());
     for e in entries {
+        if e.col_stats.len() != schema.columns.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "column stats length mismatch",
+            ));
+        }
         out.extend_from_slice(&e.offset.to_le_bytes());
         out.extend_from_slice(&e.len.to_le_bytes());
         out.extend_from_slice(&e.min_ts.to_le_bytes());
@@ -1546,11 +1936,52 @@ fn encode_table_index_payload(entries: &[TableIndexEntry]) -> Vec<u8> {
         out.extend_from_slice(&e.min_seq.to_le_bytes());
         out.extend_from_slice(&e.max_seq.to_le_bytes());
         out.extend_from_slice(&e.count.to_le_bytes());
+        for (col_schema, stats) in schema.columns.iter().zip(e.col_stats.iter()) {
+            let has = stats.is_some() as u8;
+            out.push(has);
+            match col_schema.col_type {
+                ColumnType::F64 => {
+                    let (min, max) = match stats {
+                        Some(ColumnStats::F64 { min, max }) => (*min, *max),
+                        _ => (0.0, 0.0),
+                    };
+                    out.extend_from_slice(&min.to_le_bytes());
+                    out.extend_from_slice(&max.to_le_bytes());
+                }
+                ColumnType::I64 => {
+                    let (min, max) = match stats {
+                        Some(ColumnStats::I64 { min, max }) => (*min, *max),
+                        _ => (0, 0),
+                    };
+                    out.extend_from_slice(&min.to_le_bytes());
+                    out.extend_from_slice(&max.to_le_bytes());
+                }
+                ColumnType::Bool => {
+                    let (min, max) = match stats {
+                        Some(ColumnStats::Bool { min, max }) => (*min as u8, *max as u8),
+                        _ => (0, 0),
+                    };
+                    out.push(min);
+                    out.push(max);
+                }
+                ColumnType::Utf8 => {
+                    let (min_len, max_len) = match stats {
+                        Some(ColumnStats::Utf8 { min_len, max_len }) => (*min_len, *max_len),
+                        _ => (0, 0),
+                    };
+                    out.extend_from_slice(&min_len.to_le_bytes());
+                    out.extend_from_slice(&max_len.to_le_bytes());
+                }
+            }
+        }
     }
-    out
+    Ok(out)
 }
 
-fn decode_table_index_payload(payload: &[u8]) -> io::Result<Vec<TableIndexEntry>> {
+fn decode_table_index_payload(
+    payload: &[u8],
+    schema: &TableSchema,
+) -> io::Result<Vec<TableIndexEntry>> {
     let mut pos = 0usize;
     let mut read_exact = |len: usize| -> io::Result<&[u8]> {
         if payload.len() < pos + len {
@@ -1582,6 +2013,49 @@ fn decode_table_index_payload(payload: &[u8]) -> io::Result<Vec<TableIndexEntry>
         let min_seq = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
         let max_seq = u64::from_le_bytes(read_exact(8)?.try_into().unwrap());
         let count = u32::from_le_bytes(read_exact(4)?.try_into().unwrap());
+        let mut col_stats = Vec::with_capacity(schema.columns.len());
+        for col_schema in &schema.columns {
+            let has_stats = read_exact(1)?[0] != 0;
+            let stats = match col_schema.col_type {
+                ColumnType::F64 => {
+                    let min = f64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+                    let max = f64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+                    if has_stats {
+                        Some(ColumnStats::F64 { min, max })
+                    } else {
+                        None
+                    }
+                }
+                ColumnType::I64 => {
+                    let min = i64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+                    let max = i64::from_le_bytes(read_exact(8)?.try_into().unwrap());
+                    if has_stats {
+                        Some(ColumnStats::I64 { min, max })
+                    } else {
+                        None
+                    }
+                }
+                ColumnType::Bool => {
+                    let min = read_exact(1)?[0] != 0;
+                    let max = read_exact(1)?[0] != 0;
+                    if has_stats {
+                        Some(ColumnStats::Bool { min, max })
+                    } else {
+                        None
+                    }
+                }
+                ColumnType::Utf8 => {
+                    let min_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap());
+                    let max_len = u32::from_le_bytes(read_exact(4)?.try_into().unwrap());
+                    if has_stats {
+                        Some(ColumnStats::Utf8 { min_len, max_len })
+                    } else {
+                        None
+                    }
+                }
+            };
+            col_stats.push(stats);
+        }
         entries.push(TableIndexEntry {
             offset,
             len,
@@ -1590,9 +2064,76 @@ fn decode_table_index_payload(payload: &[u8]) -> io::Result<Vec<TableIndexEntry>
             min_seq,
             max_seq,
             count,
+            col_stats,
         });
     }
     Ok(entries)
+}
+
+fn load_state_from_footer(path: &Path) -> io::Result<Option<StorageState>> {
+    let footer_offset = dbfile::read_footer_offset(path)?;
+    if footer_offset == 0 {
+        return Ok(None);
+    }
+    let (footer_hdr, footer_payload) = match dbfile::read_record_at(path, footer_offset) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if footer_hdr.record_type != dbfile::RECORD_FOOTER {
+        return Ok(None);
+    }
+    let footer = decode_footer_payload(&footer_payload)?;
+    let mut state = StorageState::default();
+
+    if let Some(meta_offset) = footer.meta_offset {
+        if let Ok((hdr, payload)) = dbfile::read_record_at(path, meta_offset) {
+            if hdr.record_type == dbfile::RECORD_META {
+                if let Ok((last_seq, _)) = decode_meta_payload(&payload) {
+                    state.max_seq = state.max_seq.max(last_seq);
+                    state.meta_offset = Some(meta_offset);
+                }
+            }
+        }
+    }
+
+    for (_name, offset) in footer.schema_offsets {
+        if offset == 0 {
+            continue;
+        }
+        let (hdr, payload) = dbfile::read_record_at(path, offset)?;
+        if hdr.record_type != dbfile::RECORD_SCHEMA {
+            continue;
+        }
+        let (table, data) = decode_name_prefix(&payload)?;
+        let schema = decode_table_schema_bytes(data)?;
+        state.schema_bytes.insert(table.clone(), data.len() as u64);
+        state.schema_offsets.insert(table.clone(), offset);
+        state.schemas.insert(table, schema);
+    }
+
+    for (_name, offset) in footer.index_offsets {
+        if offset == 0 {
+            continue;
+        }
+        let (hdr, payload) = dbfile::read_record_at(path, offset)?;
+        if hdr.record_type != dbfile::RECORD_TABLE_INDEX {
+            continue;
+        }
+        let (table, data) = decode_name_prefix(&payload)?;
+        let schema = match state.schemas.get(&table) {
+            Some(schema) => schema.clone(),
+            None => continue,
+        };
+        let entries = decode_table_index_payload(data, &schema)?;
+        for entry in &entries {
+            state.max_seq = state.max_seq.max(entry.min_seq).max(entry.max_seq);
+        }
+        state.table_index.insert(table.clone(), entries);
+        state.index_bytes.insert(table.clone(), hdr.payload_len as u64);
+        state.index_offsets.insert(table, offset);
+    }
+
+    Ok(Some(state))
 }
 
 fn scan_db_file(path: &Path) -> io::Result<StorageState> {
@@ -1603,11 +2144,21 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
                 let (name, data) = decode_name_prefix(payload)?;
                 let schema = decode_table_schema_bytes(data)?;
                 state.schema_bytes.insert(name.clone(), data.len() as u64);
+                state.schema_offsets.insert(name.clone(), hdr.record_offset);
                 state.schemas.insert(name, schema);
             }
             dbfile::RECORD_TABLE_SEGMENT => {
                 let (name, data) = decode_name_prefix(payload)?;
                 let header = parse_table_segment_header(data)?;
+                let col_stats = state
+                    .schemas
+                    .get(&name)
+                    .and_then(|schema| {
+                        read_table_segment_from_bytes(data, schema)
+                            .ok()
+                            .map(|seg| column_stats_from_cols(schema, &seg.cols))
+                    })
+                    .unwrap_or_default();
                 let name_len = name.as_bytes().len() as u64;
                 let offset = hdr.payload_offset + 2 + name_len;
                 state
@@ -1622,12 +2173,18 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
                         min_seq: header.min_seq,
                         max_seq: header.max_seq,
                         count: header.count,
+                        col_stats,
                     });
                 state.max_seq = state.max_seq.max(header.min_seq).max(header.max_seq);
             }
             dbfile::RECORD_TABLE_INDEX => {
                 let (name, data) = decode_name_prefix(payload)?;
-                let entries = decode_table_index_payload(data)?;
+                let schema = state
+                    .schemas
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "schema missing"))?;
+                let entries = decode_table_index_payload(data, &schema)?;
                 for entry in &entries {
                     state.max_seq = state
                         .max_seq
@@ -1636,7 +2193,8 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
                 }
                 state.table_index.insert(name.clone(), entries);
                 state.index_bytes
-                    .insert(name, hdr.payload_len as u64);
+                    .insert(name.clone(), hdr.payload_len as u64);
+                state.index_offsets.insert(name, hdr.record_offset);
             }
             dbfile::RECORD_SERIES_SEGMENT => {
                 let (_, data) = decode_name_prefix(payload)?;
@@ -1649,6 +2207,7 @@ fn scan_db_file(path: &Path) -> io::Result<StorageState> {
             dbfile::RECORD_META => {
                 if let Ok((last_seq, _)) = decode_meta_payload(payload) {
                     state.max_seq = state.max_seq.max(last_seq);
+                    state.meta_offset = Some(hdr.record_offset);
                 }
             }
             _ => {}
@@ -1851,7 +2410,7 @@ mod tests {
         let path = fresh_db_path("bool_packed");
         let storage = Storage::open(&path).unwrap();
         let schema = TableSchema {
-            columns: vec![Column {
+            columns: vec![ColumnSchema {
                 name: "b".to_string(),
                 col_type: ColumnType::Bool,
             }],

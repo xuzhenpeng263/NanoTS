@@ -2,7 +2,7 @@
 //
 // DataFusion integration (read-only SQL).
 
-use crate::db::{ColumnData, ColumnType, NanoTsDb};
+use crate::db::{ColumnData, ColumnPredicate, ColumnPredicateOp, ColumnPredicateValue, ColumnType, NanoTsDb};
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -27,7 +27,7 @@ pub fn query_sql(db: Arc<NanoTsDb>, sql: &str) -> DFResult<Vec<RecordBatch>> {
 
     rt.block_on(async move {
         let ctx = SessionContext::new();
-        register_time_bucket(&ctx)?;
+        register_udfs(&ctx)?;
         register_all_tables(db, &ctx)?;
         let df = ctx.sql(sql).await?;
         df.collect().await
@@ -42,6 +42,13 @@ fn register_all_tables(db: Arc<NanoTsDb>, ctx: &SessionContext) -> DFResult<()> 
         let provider = NanoTsTable::try_new(db.clone(), &table)?;
         ctx.register_table(&table, Arc::new(provider))?;
     }
+    Ok(())
+}
+
+fn register_udfs(ctx: &SessionContext) -> DFResult<()> {
+    register_time_bucket(ctx)?;
+    register_delta(ctx)?;
+    register_rate(ctx)?;
     Ok(())
 }
 
@@ -85,6 +92,116 @@ fn register_time_bucket(ctx: &SessionContext) -> DFResult<()> {
         "time_bucket",
         vec![DataType::Int64, DataType::Int64],
         DataType::Int64,
+        Volatility::Immutable,
+        fun,
+    );
+    ctx.register_udf(udf);
+    Ok(())
+}
+
+fn register_delta(ctx: &SessionContext) -> DFResult<()> {
+    let fun: ScalarFunctionImplementation = Arc::new(|args: &[ColumnarValue]| {
+        if args.len() != 2 {
+            return Err(DataFusionError::Execution(
+                "delta expects 2 arguments".to_string(),
+            ));
+        }
+        let arrays = ColumnarValue::values_to_arrays(args)
+            .map_err(|e| DataFusionError::Execution(format!("delta args: {e}")))?;
+        if let (Some(a), Some(b)) = (
+            arrays[0].as_any().downcast_ref::<Float64Array>(),
+            arrays[1].as_any().downcast_ref::<Float64Array>(),
+        ) {
+            let mut out = Vec::with_capacity(a.len());
+            for i in 0..a.len() {
+                if a.is_null(i) || b.is_null(i) {
+                    out.push(None);
+                } else {
+                    out.push(Some(a.value(i) - b.value(i)));
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(Float64Array::from(out)) as ArrayRef));
+        }
+        if let (Some(a), Some(b)) = (
+            arrays[0].as_any().downcast_ref::<Int64Array>(),
+            arrays[1].as_any().downcast_ref::<Int64Array>(),
+        ) {
+            let mut out = Vec::with_capacity(a.len());
+            for i in 0..a.len() {
+                if a.is_null(i) || b.is_null(i) {
+                    out.push(None);
+                } else {
+                    out.push(Some(a.value(i) - b.value(i)));
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(Int64Array::from(out)) as ArrayRef));
+        }
+        Err(DataFusionError::Execution(
+            "delta expects (Float64, Float64) or (Int64, Int64)".to_string(),
+        ))
+    });
+
+    let udf = create_udf(
+        "delta",
+        vec![DataType::Float64, DataType::Float64],
+        DataType::Float64,
+        Volatility::Immutable,
+        fun.clone(),
+    );
+    ctx.register_udf(udf);
+
+    let udf_i64 = create_udf(
+        "delta_i64",
+        vec![DataType::Int64, DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        fun,
+    );
+    ctx.register_udf(udf_i64);
+    Ok(())
+}
+
+fn register_rate(ctx: &SessionContext) -> DFResult<()> {
+    let fun: ScalarFunctionImplementation = Arc::new(|args: &[ColumnarValue]| {
+        if args.len() != 3 {
+            return Err(DataFusionError::Execution(
+                "rate expects 3 arguments".to_string(),
+            ));
+        }
+        let arrays = ColumnarValue::values_to_arrays(args)
+            .map_err(|e| DataFusionError::Execution(format!("rate args: {e}")))?;
+        let a = arrays[0]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| DataFusionError::Execution("rate expects Float64 values".to_string()))?;
+        let b = arrays[1]
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| DataFusionError::Execution("rate expects Float64 values".to_string()))?;
+        let dt = arrays[2]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataFusionError::Execution("rate expects Int64 dt".to_string()))?;
+        let mut out = Vec::with_capacity(a.len());
+        for i in 0..a.len() {
+            if a.is_null(i) || b.is_null(i) || dt.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let dt_ms = dt.value(i);
+            if dt_ms == 0 {
+                out.push(None);
+                continue;
+            }
+            out.push(Some((a.value(i) - b.value(i)) / (dt_ms as f64)));
+        }
+        Ok(ColumnarValue::Array(Arc::new(Float64Array::from(out)) as ArrayRef))
+    });
+
+    let udf = create_udf(
+        "rate",
+        vec![DataType::Float64, DataType::Float64, DataType::Int64],
+        DataType::Float64,
         Volatility::Immutable,
         fun,
     );
@@ -177,13 +294,14 @@ impl TableProvider for NanoTsTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let (start, end) = extract_time_range(filters);
+        let predicates = extract_column_predicates(filters);
         let db = self.db.clone();
         let table = self.table.clone();
         let schema = self.schema.clone();
         let limit_copy = limit;
         let batches = task::spawn_blocking(move || {
             let (ts, cols) = db
-                .query_table_range_typed(&table, start, end)
+                .query_table_range_typed_with_predicates(&table, start, end, &predicates)
                 .map_err(|e| DataFusionError::Execution(format!("query failed: {e}")))?;
             NanoTsTable::build_batches(schema, ts, cols, limit_copy)
         })
@@ -215,7 +333,9 @@ impl TableProvider for NanoTsTable {
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let mut out = Vec::with_capacity(filters.len());
         for f in filters {
-            if is_time_range_filter(f) {
+            if has_value_predicate(f) {
+                out.push(TableProviderFilterPushDown::Inexact);
+            } else if is_time_range_filter(f) {
                 out.push(TableProviderFilterPushDown::Exact);
             } else {
                 out.push(TableProviderFilterPushDown::Unsupported);
@@ -244,10 +364,6 @@ fn build_table_schema(db: &NanoTsDb, table: &str) -> DFResult<SchemaRef> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn is_time_range_filter(expr: &Expr) -> bool {
-    time_range_from_expr(expr).is_some()
-}
-
 fn extract_time_range(filters: &[Expr]) -> (i64, i64) {
     let mut start = i64::MIN;
     let mut end = i64::MAX;
@@ -264,12 +380,35 @@ fn extract_time_range(filters: &[Expr]) -> (i64, i64) {
     (start, end)
 }
 
+fn extract_column_predicates(filters: &[Expr]) -> Vec<ColumnPredicate> {
+    let mut out = Vec::new();
+    for f in filters {
+        collect_predicates(f, &mut out);
+    }
+    out
+}
+
+fn is_time_range_filter(expr: &Expr) -> bool {
+    time_range_from_expr(expr).is_some()
+}
+
+fn has_value_predicate(expr: &Expr) -> bool {
+    let mut out = Vec::new();
+    collect_predicates(expr, &mut out);
+    !out.is_empty()
+}
+
 fn time_range_from_expr(expr: &Expr) -> Option<(Option<i64>, Option<i64>)> {
     match expr {
         Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-            let left = time_range_from_expr(&binary.left)?;
-            let right = time_range_from_expr(&binary.right)?;
-            Some(merge_ranges(left, right))
+            let left = time_range_from_expr(&binary.left);
+            let right = time_range_from_expr(&binary.right);
+            match (left, right) {
+                (None, None) => None,
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (Some(l), Some(r)) => Some(merge_ranges(l, r)),
+            }
         }
         Expr::BinaryExpr(binary) => {
             let op = binary.op;
@@ -293,6 +432,44 @@ fn time_range_from_expr(expr: &Expr) -> Option<(Option<i64>, Option<i64>)> {
             }
         }
         _ => None,
+    }
+}
+
+fn collect_predicates(expr: &Expr, out: &mut Vec<ColumnPredicate>) {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            collect_predicates(&binary.left, out);
+            collect_predicates(&binary.right, out);
+        }
+        Expr::BinaryExpr(binary) => {
+            let op = match binary.op {
+                Operator::Eq => ColumnPredicateOp::Eq,
+                Operator::Gt => ColumnPredicateOp::Gt,
+                Operator::GtEq => ColumnPredicateOp::GtEq,
+                Operator::Lt => ColumnPredicateOp::Lt,
+                Operator::LtEq => ColumnPredicateOp::LtEq,
+                _ => return,
+            };
+            let (col, lit) = match (&*binary.left, &*binary.right) {
+                (Expr::Column(c), Expr::Literal(v)) => (Some(&c.name), Some(v)),
+                (Expr::Literal(v), Expr::Column(c)) => (Some(&c.name), Some(v)),
+                _ => (None, None),
+            };
+            let col = match col {
+                Some(col) if col != "ts" && col != "ts_ms" => col,
+                _ => return,
+            };
+            let value = match scalar_to_predicate_value(lit.unwrap()) {
+                Some(v) => v,
+                None => return,
+            };
+            out.push(ColumnPredicate {
+                column: col.to_string(),
+                op,
+                value,
+            });
+        }
+        _ => {}
     }
 }
 
@@ -324,6 +501,21 @@ fn scalar_to_i64(value: &ScalarValue) -> Option<i64> {
         ScalarValue::TimestampMillisecond(Some(v), _) => Some(*v),
         ScalarValue::TimestampMicrosecond(Some(v), _) => Some(*v / 1_000),
         ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v / 1_000_000),
+        _ => None,
+    }
+}
+
+fn scalar_to_predicate_value(value: &ScalarValue) -> Option<ColumnPredicateValue> {
+    match value {
+        ScalarValue::Float64(Some(v)) => Some(ColumnPredicateValue::F64(*v)),
+        ScalarValue::Float32(Some(v)) => Some(ColumnPredicateValue::F64(*v as f64)),
+        ScalarValue::Int64(Some(v)) => Some(ColumnPredicateValue::I64(*v)),
+        ScalarValue::Int32(Some(v)) => Some(ColumnPredicateValue::I64(*v as i64)),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(*v)
+            .ok()
+            .map(ColumnPredicateValue::I64),
+        ScalarValue::UInt32(Some(v)) => Some(ColumnPredicateValue::I64(*v as i64)),
+        ScalarValue::Boolean(Some(v)) => Some(ColumnPredicateValue::Bool(*v)),
         _ => None,
     }
 }

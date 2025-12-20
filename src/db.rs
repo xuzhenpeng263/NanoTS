@@ -97,6 +97,29 @@ impl ColumnType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPredicateOp {
+    Eq,
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnPredicateValue {
+    F64(f64),
+    I64(i64),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnPredicate {
+    pub column: String,
+    pub op: ColumnPredicateOp,
+    pub value: ColumnPredicateValue,
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
     pub name: String,
@@ -718,6 +741,7 @@ impl NanoTsDb {
         for t in self.tables.keys() {
             self.storage.write_table_index(t)?;
         }
+        self.storage.write_footer()?;
         self.wal.reset()?;
         self.wal_bytes = 0;
         Ok(())
@@ -788,10 +812,24 @@ impl NanoTsDb {
         start_ms: i64,
         end_ms: i64,
     ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
+        self.query_table_range_typed_with_predicates(table, start_ms, end_ms, &[])
+    }
+
+    pub fn query_table_range_typed_with_predicates(
+        &self,
+        table: &str,
+        start_ms: i64,
+        end_ms: i64,
+        predicates: &[ColumnPredicate],
+    ) -> io::Result<(Vec<i64>, Vec<ColumnData>)> {
         let schema = self.storage.read_table_schema(table)?;
-        let mut out = self
-            .storage
-            .read_table_columns_in_range(table, &schema, start_ms, end_ms)?;
+        let mut out = self.storage.read_table_columns_in_range_filtered(
+            table,
+            &schema,
+            start_ms,
+            end_ms,
+            predicates,
+        )?;
 
         if let Some(buf) = self.tables.get(table) {
             for r in &buf.rows {

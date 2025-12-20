@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 pub const FILE_MAGIC: &[u8; 4] = b"NTSF";
 pub const FILE_VERSION: u8 = 1;
+const FILE_HEADER_LEN: u64 = 13;
 
 pub const RECORD_META: u8 = 1;
 pub const RECORD_SCHEMA: u8 = 2;
@@ -15,6 +16,7 @@ pub const RECORD_WAL: u8 = 4;
 pub const RECORD_WAL_CHECKPOINT: u8 = 5;
 pub const RECORD_SERIES_SEGMENT: u8 = 6;
 pub const RECORD_TABLE_INDEX: u8 = 7;
+pub const RECORD_FOOTER: u8 = 8;
 
 const DEFAULT_MAX_RECORD_SIZE: u32 = 64 * 1024 * 1024;
 
@@ -67,22 +69,30 @@ pub fn ensure_db_file(path: &Path) -> io::Result<()> {
     if len == 0 {
         file.write_all(FILE_MAGIC)?;
         file.write_all(&[FILE_VERSION])?;
+        file.write_all(&0u64.to_le_bytes())?;
         file.flush()?;
         return Ok(());
     }
-    if len < 5 {
+    if len < FILE_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "db file header too short",
         ));
     }
-    let mut hdr = [0u8; 5];
+    let mut hdr = [0u8; 13];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut hdr)?;
     if &hdr[0..4] != FILE_MAGIC || hdr[4] != FILE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid db file header",
+        ));
+    }
+    let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    if footer_offset != 0 && !is_valid_footer_offset(path, footer_offset)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid footer offset",
         ));
     }
     Ok(())
@@ -100,6 +110,7 @@ pub fn create_new_db_file(path: &Path) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(FILE_MAGIC)?;
     file.write_all(&[FILE_VERSION])?;
+    file.write_all(&0u64.to_le_bytes())?;
     file.flush()?;
     Ok(())
 }
@@ -143,7 +154,7 @@ where
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
-    let mut hdr = [0u8; 5];
+    let mut hdr = [0u8; 13];
     if reader.read_exact(&mut hdr).is_err() {
         return Ok(());
     }
@@ -153,7 +164,7 @@ where
             "invalid db file header",
         ));
     }
-    let mut offset = 5u64;
+    let mut offset = FILE_HEADER_LEN;
     loop {
         let mut head = [0u8; 5];
         match reader.read_exact(&mut head) {
@@ -181,11 +192,27 @@ where
         }
 
         let mut payload = vec![0u8; payload_len as usize];
-        reader.read_exact(&mut payload)?;
+        if let Err(e) = reader.read_exact(&mut payload) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record payload truncated",
+                ));
+            }
+            return Err(e);
+        }
         offset += payload_len as u64;
 
         let mut checksum_buf = [0u8; 4];
-        reader.read_exact(&mut checksum_buf)?;
+        if let Err(e) = reader.read_exact(&mut checksum_buf) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record checksum truncated",
+                ));
+            }
+            return Err(e);
+        }
         offset += 4;
         let checksum = u32::from_le_bytes(checksum_buf);
 
@@ -208,6 +235,100 @@ where
         };
         on_record(header, &payload)?;
     }
+}
+
+pub fn read_record_at(path: &Path, record_offset: u64) -> io::Result<(RecordHeader, Vec<u8>)> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if record_offset + 5 > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record offset out of bounds",
+        ));
+    }
+    file.seek(SeekFrom::Start(record_offset))?;
+    let mut head = [0u8; 5];
+    file.read_exact(&mut head)?;
+    let record_type = head[0];
+    let payload_len = u32::from_le_bytes(head[1..5].try_into().unwrap());
+    if payload_len > max_record_size() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record payload too large",
+        ));
+    }
+    let payload_offset = record_offset + 5;
+    let remaining = file_len.saturating_sub(payload_offset);
+    let needed = payload_len as u64 + 4;
+    if remaining < needed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record length out of bounds",
+        ));
+    }
+    let mut payload = vec![0u8; payload_len as usize];
+    file.read_exact(&mut payload)?;
+    let mut checksum_buf = [0u8; 4];
+    file.read_exact(&mut checksum_buf)?;
+    let checksum = u32::from_le_bytes(checksum_buf);
+    let mut verify = Vec::with_capacity(1 + payload.len());
+    verify.push(record_type);
+    verify.extend_from_slice(&payload_len.to_le_bytes());
+    verify.extend_from_slice(&payload);
+    if fnv1a32(&verify) != checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record checksum mismatch",
+        ));
+    }
+    Ok((
+        RecordHeader {
+            record_type,
+            payload_len,
+            record_offset,
+            payload_offset,
+        },
+        payload,
+    ))
+}
+
+pub fn read_footer_offset(path: &Path) -> io::Result<u64> {
+    let mut file = File::open(path)?;
+    let mut hdr = [0u8; 13];
+    file.read_exact(&mut hdr)?;
+    if &hdr[0..4] != FILE_MAGIC || hdr[4] != FILE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid db file header",
+        ));
+    }
+    let offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    if offset != 0 && !is_valid_footer_offset(path, offset)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid footer offset",
+        ));
+    }
+    Ok(offset)
+}
+
+pub fn write_footer_offset(path: &Path, footer_offset: u64) -> io::Result<()> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.seek(SeekFrom::Start(5))?;
+    file.write_all(&footer_offset.to_le_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn is_valid_footer_offset(path: &Path, offset: u64) -> io::Result<bool> {
+    let (hdr, payload) = read_record_at(path, offset)?;
+    if hdr.record_type != RECORD_FOOTER {
+        return Ok(false);
+    }
+    if payload.len() < 4 + 1 + 8 + 4 + 4 {
+        return Ok(false);
+    }
+    Ok(&payload[0..4] == b"NTSF" && payload[4] == 1)
 }
 
 pub fn temp_db_path(base: &Path, suffix: &str) -> PathBuf {
@@ -254,6 +375,7 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(FILE_MAGIC).unwrap();
         file.write_all(&[FILE_VERSION]).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
 
         let payload_len: u32 = 4;
         let mut header = [0u8; 5];

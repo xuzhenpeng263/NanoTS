@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use nanots_core::arrow::{ArrowArray, ArrowSchema};
-use nanots_core::db::{ColumnData, ColumnType, Value};
+use nanots_core::db::{AutoMaintenanceOptions, ColumnData, ColumnType, Value};
 use nanots_core::{NanoTsDb, NanoTsOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -18,10 +18,11 @@ struct Db {
 #[pymethods]
 impl Db {
     #[new]
-    #[pyo3(signature = (path, retention_ms=None))]
-    fn new(path: &str, retention_ms: Option<u64>) -> PyResult<Self> {
+    #[pyo3(signature = (path, retention_ms=None, auto_maintenance=None))]
+    fn new(py: Python<'_>, path: &str, retention_ms: Option<u64>, auto_maintenance: Option<PyObject>) -> PyResult<Self> {
         let opts = NanoTsOptions {
             retention: retention_ms.map(Duration::from_millis),
+            auto_maintenance: parse_auto_maintenance(py, auto_maintenance)?,
             ..Default::default()
         };
         let db = NanoTsDb::open(path, opts).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -354,6 +355,48 @@ fn stats(&self, py: Python<'_>, table: &str) -> PyResult<PyObject> {
             None => Ok(py.None()),
         }
     }
+}
+
+fn parse_auto_maintenance(
+    py: Python<'_>,
+    auto_maintenance: Option<PyObject>,
+) -> PyResult<Option<AutoMaintenanceOptions>> {
+    let Some(obj) = auto_maintenance else {
+        return Ok(Some(AutoMaintenanceOptions::default()));
+    };
+    let bound = obj.bind(py);
+    if bound.is_none() {
+        return Ok(Some(AutoMaintenanceOptions::default()));
+    }
+    if let Ok(flag) = bound.extract::<bool>() {
+        return if flag {
+            Ok(Some(AutoMaintenanceOptions::default()))
+        } else {
+            Ok(None)
+        };
+    }
+    if let Ok(dict) = bound.downcast::<PyDict>() {
+        let mut opts = AutoMaintenanceOptions::default();
+        if let Ok(Some(v)) = dict.get_item("check_interval_ms") {
+            opts.check_interval = Duration::from_millis(v.extract::<u64>()?);
+        }
+        if let Ok(Some(v)) = dict.get_item("retention_check_interval_ms") {
+            opts.retention_check_interval = Duration::from_millis(v.extract::<u64>()?);
+        }
+        if let Ok(Some(v)) = dict.get_item("wal_target_ratio") {
+            opts.wal_target_ratio = v.extract::<u64>()?;
+        }
+        if let Ok(Some(v)) = dict.get_item("wal_min_bytes") {
+            opts.wal_min_bytes = v.extract::<u64>()?;
+        }
+        if let Ok(Some(v)) = dict.get_item("target_segment_points") {
+            opts.target_segment_points = v.extract::<usize>()?;
+        }
+        return Ok(Some(opts));
+    }
+    Err(PyRuntimeError::new_err(
+        "auto_maintenance must be a dict, bool, or None",
+    ))
 }
 
 fn parse_column_type(ty: &str) -> PyResult<ColumnType> {

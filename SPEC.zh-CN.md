@@ -10,6 +10,7 @@
 
 - `magic`：4 bytes = `NTSF`
 - `version`：u8 = `1`
+- `footer_offset`：u64（`0` 表示无 footer）
 
 文件头之后是连续的**记录（record）**：
 
@@ -29,6 +30,7 @@
 - `5` = WAL Checkpoint
 - `6` = Series Segment（历史单列）
 - `7` = Table Index（持久化索引）
+- `8` = Footer
 
 ### Meta 记录（type = 1）
 
@@ -82,6 +84,24 @@ Payload：
 - `name_len`：u16
 - `name_bytes`：`name_len` bytes（UTF-8 表名）
 - `index_bytes`：见 **Table Index Payload**
+
+### Footer 记录（type = 8）
+
+Payload：
+
+- `magic`：4 bytes = `NTSF`
+- `version`：u8 = `1`
+- `meta_offset`：u64（`0` 表示无）
+- `schema_count`：u32
+- 对每个 schema：
+  - `name_len`：u16
+  - `name_bytes`：`name_len` bytes（UTF-8 表名）
+  - `record_offset`：u64（schema 记录偏移）
+- `index_count`：u32
+- 对每个 index：
+  - `name_len`：u16
+  - `name_bytes`：`name_len` bytes（UTF-8 表名）
+  - `record_offset`：u64（index 记录偏移）
 
 ## Schema Payload
 
@@ -181,9 +201,9 @@ Header：
 
 - `magic`：4 bytes = `NTSI`
 - `version`：u8 = `1`
-- `entry_count`：u32
+- `count`：u32（segment 数量）
 
-接着重复 `entry_count` 次：
+接着重复 `count` 次：
 
 - `offset`：u64（segment 在 `.ntt` 内的偏移）
 - `len`：u64（segment 字节长度）
@@ -192,3 +212,9 @@ Header：
 - `min_seq`：u64
 - `max_seq`：u64
 - `count`：u32（segment 行数）
+- 按列（schema 顺序）：
+  - `has_stats`：u8（`0` 或 `1`）
+  - 列为 `F64`：`min`: f64，`max`: f64
+  - 列为 `I64`：`min`: i64，`max`: i64
+  - 列为 `Bool`：`min`: u8，`max`: u8
+  - 列为 `Utf8`：`min_len`: u32，`max_len`: u32

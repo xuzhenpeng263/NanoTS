@@ -10,7 +10,12 @@ class Db:
     一个嵌入式、仅追加写入、高性能的时序数据库内核。
     """
 
-    def __init__(self, path: str, retention_ms: Optional[int] = None) -> None: ...
+    def __init__(
+        self,
+        path: str,
+        retention_ms: Optional[int] = None,
+        auto_maintenance: Optional[dict[str, Any] | bool] = None,
+    ) -> None: ...
 
     def create_table(self, table: str, columns: list[str]) -> None: ...
     def create_table_typed(self, table: str, columns: list[tuple[str, str]]) -> None: ...
